@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+# crc — manage Claude Code remote-control servers on this machine.
+# One server per workspace, each in a detached tmux session, listed in an INI registry.
+set -uo pipefail
+
+# Resolve through symlinks: crc is normally reached via a symlink in ~/.local/bin or
+# Homebrew's bin, and the libraries sit next to the real file, not next to the link.
+# (readlink -f is GNU-only; macOS does not have it.)
+crc_self="${BASH_SOURCE[0]}"
+while [ -L "$crc_self" ]; do
+  crc_link_dir="$(cd -P "$(dirname "$crc_self")" && pwd)"
+  crc_self="$(readlink "$crc_self")"
+  case "$crc_self" in /*) ;; *) crc_self="$crc_link_dir/$crc_self" ;; esac
+done
+CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$CRC_ROOT/lib/platform.sh"
+# shellcheck source=/dev/null
+. "$CRC_ROOT/lib/registry.sh"
+# shellcheck source=/dev/null
+. "$CRC_ROOT/lib/server.sh"
+
+VERSION="1.1.0"
+
+crc_migrate_legacy
+
+usage() {
+  cat <<EOF
+crc $VERSION — manage Claude Code remote-control servers
+
+usage: crc <command> [args]
+
+  list                          show every server, its state and environment id
+  add <name> [options]          register a workspace and start its server
+  start [name...|--all]         start servers that are not running
+  restart <name...|--all>       restart named servers (others are untouched)
+  stop <name...|--all>          stop servers
+  remove <name> [--purge]       stop, unregister, optionally delete the directory
+  trust <name>                  accept the one-time workspace/MCP dialogs
+  sessions <name>               list revivable chat sessions, newest first
+  revive <session-id> [name]    reattach an old chat session
+  tick                          what the supervisor runs: start anything missing
+  doctor                        check tools, registry and per-server readiness
+  supervise <install|uninstall|status>
+                                install the boot + watchdog service
+  env <name>                    print the claude.ai URL for a server
+  version
+
+add options:
+  --repo <url>                  clone this repository
+  --create <owner/name>         create the repo with gh, then use it
+  --dir <path>                  use an existing directory (default: \$CRC_WORKSPACE_ROOT/<name>)
+  --private | --public          visibility for --create (default: private)
+  --spawn <worktree|same-dir|session>
+  --permission-mode <mode>      default: bypassPermissions
+  --mcp-from <name>             copy .mcp.json from another registered workspace
+  --no-start                    register only
+
+global:
+  CRC_DRY_RUN=1                 print what would happen, change nothing
+  CRC_HOME                      state dir: registry + logs (default ~/.crc)
+EOF
+}
+
+# Expand a name list or --all into concrete server names.
+resolve_names() {
+  local args="$*"
+  if [ -z "$args" ] || [ "$args" = "--all" ]; then reg_names; return; fi
+  local n
+  for n in $args; do
+    case "$n" in --*) continue ;; esac
+    reg_has "$n" || die "unknown server: $n (see 'crc list')"
+    echo "$n"
+  done
+}
+
+cmd_list() {
+  reg_init
+  local names; names="$(reg_names)"
+  [ -z "$names" ] && { say "no servers registered — add one with 'crc add <name> --repo <url>'"; return 0; }
+  printf '%-14s %-9s %-8s %-30s %s\n' NAME STATE PIDS ENVIRONMENT DIR
+  local n pids env state
+  for n in $names; do
+    state="$(srv_state "$n")"
+    pids="$(srv_pids "$n" | tr '\n' ',' | sed 's/,$//')"
+    env="$(srv_env_id "$n" 2>/dev/null || echo -)"
+    printf '%-14s %-9s %-8s %-30s %s\n' "$n" "$state" "${pids:--}" "${env:--}" "$(srv_dir "$n" 2>/dev/null || echo -)"
+  done
+}
+
+cmd_env() {
+  local n="${1:-}"; [ -n "$n" ] || die "usage: crc env <name>"
+  local e; e="$(srv_env_id "$n")" || die "$n: no environment yet (has it ever created a session?)"
+  say "https://claude.ai/code?environment=$e"
+}
+
+# resolve_names runs in a subshell, so its die() cannot exit us: check the status.
+cmd_start() { local names n; names="$(resolve_names "$@")" || exit 1
+  for n in $names; do srv_start "$n"; done; }
+cmd_stop()  { local names n; names="$(resolve_names "$@")" || exit 1
+  for n in $names; do srv_stop "$n"; done; }
+
+cmd_restart() {
+  [ $# -gt 0 ] || die "usage: crc restart <name...>|--all"
+  local names n; names="$(resolve_names "$@")" || exit 1
+  # Warn before destroying work the user cannot see.
+  local live; live="$(pgrep -f 'sdk-url' 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${live:-0}" -gt 0 ] && warn "note: $live chat session(s) running on this machine will be interrupted if they belong to these servers"
+  for n in $names; do srv_stop "$n"; done
+  sleep 3
+  for n in $names; do srv_start "$n"; done
+  sleep 2
+  cmd_list
+}
+
+cmd_tick() {
+  reg_init
+  local n need=0
+  for n in $(reg_names); do
+    [ "$(reg_get "$n" enabled true)" = true ] || continue
+    srv_running "$n" || need=1
+  done
+  [ "$need" = 1 ] && crc_wait_for_network
+  for n in $(reg_names); do srv_start "$n" >/dev/null 2>&1 || true; done
+}
+
+cmd_add() {
+  local name="${1:-}"; shift || true
+  [ -n "$name" ] || die "usage: crc add <name> [--repo url | --create owner/name | --dir path]"
+  case "$name" in --*) die "first argument must be the server name" ;; esac
+  reg_has "$name" && die "$name is already registered (crc remove $name first)"
+
+  local repo="" create="" dir="" vis="--private" spawn="worktree" mode="bypassPermissions"
+  local mcp_from="" start=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)            repo="${2:-}"; shift 2 ;;
+      --create)          create="${2:-}"; shift 2 ;;
+      --dir)             dir="${2:-}"; shift 2 ;;
+      --private)         vis="--private"; shift ;;
+      --public)          vis="--public"; shift ;;
+      --spawn)           spawn="${2:-}"; shift 2 ;;
+      --permission-mode) mode="${2:-}"; shift 2 ;;
+      --mcp-from)        mcp_from="${2:-}"; shift 2 ;;
+      --no-start)        start=0; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  local git gh; git="$(crc_git)" || die "git not found"
+  [ -z "$dir" ] && dir="$(crc_workspace_root)/$name"
+
+  if [ -n "$create" ]; then
+    gh="$(crc_gh)" || die "--create needs the gh CLI (https://cli.github.com)"
+    "$gh" auth status >/dev/null 2>&1 || die "gh is not authenticated: run 'gh auth login'"
+    say "creating $create on GitHub ($vis)"
+    "$gh" repo create "$create" "$vis" >/dev/null || die "gh repo create failed"
+    repo="$("$gh" repo view "$create" --json sshUrl -q .sshUrl)"
+  fi
+
+  if [ -d "$dir/.git" ]; then
+    say "using existing repository at $dir"
+    [ -z "$repo" ] && repo="$("$git" -C "$dir" remote get-url origin 2>/dev/null || echo '')"
+  elif [ -n "$repo" ]; then
+    say "cloning $repo -> $dir"
+    mkdir -p "$(dirname "$dir")"
+    "$git" clone "$repo" "$dir" || die "clone failed"
+  else
+    die "no repository: pass --repo <url>, --create <owner/name>, or --dir <existing git repo>"
+  fi
+
+  # An empty repo has no commit, and worktree spawn needs one.
+  if ! "$git" -C "$dir" rev-parse HEAD >/dev/null 2>&1; then
+    say "repository has no commits: creating an empty initial commit"
+    "$git" -C "$dir" -c user.email="$("$git" config user.email 2>/dev/null || echo crc@localhost)" \
+                     -c user.name="$("$git" config user.name 2>/dev/null || echo crc)" \
+                     commit -q --allow-empty -m "chore: initial commit"
+    "$git" -C "$dir" push -q -u origin HEAD 2>/dev/null || true
+  fi
+
+  if [ -n "$mcp_from" ]; then
+    local src; src="$(srv_dir "$mcp_from" 2>/dev/null || echo '')"
+    if [ -n "$src" ] && [ -f "$src/.mcp.json" ]; then
+      cp "$src/.mcp.json" "$dir/.mcp.json"; say "copied .mcp.json from $mcp_from"
+    else
+      warn "no .mcp.json found for $mcp_from — skipping"
+    fi
+  fi
+
+  reg_set "$name" dir "$dir"
+  [ -n "$repo" ] && reg_set "$name" repo "$repo"
+  reg_set "$name" spawn "$spawn"
+  reg_set "$name" permission_mode "$mode"
+  reg_set "$name" enabled true
+  say "registered $name -> $dir"
+
+  local why
+  if ! why="$(srv_preflight "$name")"; then
+    warn ""
+    warn "$name is registered but not ready: $why"
+    warn "run 'crc trust $name' (accepts the workspace-trust and MCP dialogs once), then 'crc start $name'"
+    return 0
+  fi
+  [ "$start" = 1 ] && srv_start "$name"
+}
+
+# The trust and MCP dialogs are interactive and block server startup until accepted.
+# Drive them once through tmux, then verify the result rather than assuming it worked.
+cmd_trust() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: crc trust <name>"
+  reg_has "$name" || die "unknown server: $name"
+  local dir tmux claude s; dir="$(srv_dir "$name")"
+  tmux="$(crc_tmux)"; claude="$(crc_claude)"; s="crc-trust-$$"
+  say "opening $dir to accept the one-time dialogs…"
+  "$tmux" new-session -d -s "$s" -c "$dir"
+  sleep 1
+  "$tmux" send-keys -t "${s}:0.0" "cd $(printf '%q' "$dir") && $(printf '%q' "$claude")" C-m
+  sleep 9;  "$tmux" send-keys -t "${s}:0.0" Enter   # trust folder
+  sleep 8;  "$tmux" send-keys -t "${s}:0.0" Enter   # approve project MCP servers, if asked
+  sleep 8;  "$tmux" send-keys -t "${s}:0.0" "/exit" C-m
+  sleep 4;  "$tmux" kill-session -t "=$s" 2>/dev/null || true
+  if srv_preflight "$name" >/dev/null; then
+    say "$name: ready"
+  else
+    warn "$name is still not ready. Accept the dialogs by hand:  cd $dir && claude"
+  fi
+}
+
+cmd_remove() {
+  local name="${1:-}"; shift || true
+  [ -n "$name" ] || die "usage: crc remove <name> [--purge|--keep-dir]"
+  reg_has "$name" || die "unknown server: $name"
+  local purge=ask
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge)    purge=yes; shift ;;
+      --keep-dir) purge=no;  shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  local dir; dir="$(srv_dir "$name" 2>/dev/null || echo '')"
+
+  if [ "$purge" = ask ]; then
+    if [ -t 0 ]; then
+      printf 'delete the local directory %s ? [y/N] ' "$dir"
+      read -r ans
+      case "$ans" in [yY]*) purge=yes ;; *) purge=no ;; esac
+    else
+      purge=no                      # never delete data on a guess
+    fi
+  fi
+
+  srv_stop "$name"
+  reg_remove_section "$name"
+  say "$name: unregistered"
+
+  if [ "$purge" = yes ] && [ -n "$dir" ] && [ -d "$dir" ]; then
+    # Worktrees are git-locked; unlock so the tree can actually be removed.
+    local git; git="$(crc_git)"
+    "$git" -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | while read -r w; do
+      [ "$w" = "$dir" ] && continue
+      "$git" -C "$dir" worktree unlock "$w" 2>/dev/null || true
+      "$git" -C "$dir" worktree remove --force "$w" 2>/dev/null || true
+    done
+    if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would delete $dir"
+    else rm -rf "$dir"; say "deleted $dir"; fi
+  else
+    [ -n "$dir" ] && say "kept $dir"
+  fi
+  crc_log "$name removed (purge=$purge)"
+}
+
+# Old chats survive a server restart but do not resume by themselves: they need a
+# process. --session-id runs one session and exits, and cannot be combined with --spawn.
+cmd_revive() {
+  local sid="${1:-}" name="${2:-}" dir tmux claude session
+  [ -n "$sid" ] || die "usage: crc revive <session-id> [server]   (ids: crc sessions <server>)"
+  case "$sid" in bridge-cse_*) sid="cse_${sid#bridge-cse_}" ;; esac
+  if [ -n "$name" ]; then
+    reg_has "$name" || die "unknown server: $name"
+    dir="$(srv_dir "$name")"
+  else
+    # Find which registered workspace owns this session's worktree.
+    local n d
+    for n in $(reg_names); do
+      d="$(srv_dir "$n" 2>/dev/null || echo '')"
+      [ -n "$d" ] && [ -d "$d/.claude/worktrees/bridge-$sid" ] && { dir="$d"; name="$n"; break; }
+    done
+    [ -n "${dir:-}" ] || die "no registered workspace owns $sid — pass the server name explicitly"
+  fi
+  tmux="$(crc_tmux)"; claude="$(crc_claude)"; session="rev-$(printf '%s' "$sid" | cut -c5-12)"
+  if "$tmux" has-session -t "=$session" 2>/dev/null; then say "$session already running"; return 0; fi
+  if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would revive $sid in $dir"; return 0; fi
+  "$tmux" new-session -d -s "$session" -c "$dir"
+  sleep 1
+  "$tmux" send-keys -t "${session}:0.0" "cd $(printf '%q' "$dir") && $(printf '%q' "$claude") remote-control --session-id $sid" C-m
+  crc_log "revived $sid ($name)"
+  say "revived $sid in tmux session $session"
+}
+
+# List revivable chat sessions for a server, newest first.
+cmd_sessions() {
+  local name="${1:-}" dir
+  [ -n "$name" ] || die "usage: crc sessions <server>"
+  reg_has "$name" || die "unknown server: $name"
+  dir="$(srv_dir "$name")"
+  [ -d "$dir/.claude/worktrees" ] || { say "no chat worktrees yet for $name"; return 0; }
+  ls -t "$dir/.claude/worktrees" | sed 's/^bridge-//'
+}
+
+cmd_doctor() {
+  local ok=0
+  say "platform:  $(crc_os) ($(uname -m))"
+  local t c g h
+  t="$(crc_tmux   2>/dev/null || echo MISSING)"; say "tmux:      $t"
+  c="$(crc_claude 2>/dev/null || echo MISSING)"; say "claude:    $c $( [ -x "$c" ] && "$c" --version 2>/dev/null )"
+  g="$(crc_git    2>/dev/null || echo MISSING)"; say "git:       $g"
+  h="$(crc_gh     2>/dev/null || echo 'not installed (needed only for crc add --create)')"; say "gh:        $h"
+  say "registry:  $(crc_registry)"
+  say "logs:      $(crc_log_dir)"
+  [ "$t" = MISSING ] && { warn "tmux is required"; ok=1; }
+  [ "$c" = MISSING ] && { warn "claude is required"; ok=1; }
+
+  # Credentials: a headless box cannot read a locked login keychain.
+  if [ -f "$HOME/.claude/.credentials.json" ]; then say "auth:      ~/.claude/.credentials.json"
+  else warn "auth:      no credentials file — run 'claude' once and sign in, or remote sessions will not register"; fi
+
+  say ""
+  local n why
+  for n in $(reg_names); do
+    if why="$(srv_preflight "$n")"; then printf '  %-14s ok (%s)\n' "$n" "$(srv_state "$n")"
+    else printf '  %-14s NOT READY: %s\n' "$n" "$why"; ok=1; fi
+  done
+  return $ok
+}
+
+supervise_label() { echo "com.claude.remote-control"; }
+
+cmd_supervise() {
+  local action="${1:-status}"
+  local label; label="$(supervise_label)"
+  case "$(crc_os)" in
+  macos)
+    local plist="/Library/LaunchDaemons/$label.plist"
+    case "$action" in
+    install)
+      # A LaunchDaemon, not a LaunchAgent: on a headless Mac nobody logs in at the
+      # console, and LaunchAgents never fire until someone does.
+      local tmp; tmp="$(mktemp)"
+      cat > "$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>UserName</key><string>$(id -un)</string>
+  <key>ProgramArguments</key>
+  <array><string>$CRC_ROOT/bin/crc</string><string>tick</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>${CRC_TICK_INTERVAL:-300}</integer>
+  <key>WorkingDirectory</key><string>$HOME</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>HOME</key><string>$HOME</string></dict>
+  <key>StandardOutPath</key><string>$(crc_log_dir)/supervisor.out.log</string>
+  <key>StandardErrorPath</key><string>$(crc_log_dir)/supervisor.err.log</string>
+</dict>
+</plist>
+EOF
+      mkdir -p "$(crc_log_dir)"
+      say "installing $plist (needs sudo)"
+      sudo install -o root -g wheel -m 644 "$tmp" "$plist" || die "install failed"
+      rm -f "$tmp"
+      sudo launchctl bootout "system/$label" 2>/dev/null || true
+      sudo launchctl bootstrap system "$plist" || die "bootstrap failed"
+      say "installed. Also recommended:  sudo pmset -a sleep 0 autorestart 1"
+      ;;
+    uninstall)
+      sudo launchctl bootout "system/$label" 2>/dev/null || true
+      sudo rm -f "$plist"; say "removed $plist" ;;
+    status)
+      sudo launchctl print "system/$label" 2>/dev/null | grep -E 'state|runs|last exit' || say "not installed" ;;
+    *) die "usage: crc supervise <install|uninstall|status>" ;;
+    esac ;;
+  linux)
+    local unit="$HOME/.config/systemd/user/$label.service"
+    local timer="$HOME/.config/systemd/user/$label.timer"
+    case "$action" in
+    install)
+      mkdir -p "$(dirname "$unit")" "$(crc_log_dir)"
+      cat > "$unit" <<EOF
+[Unit]
+Description=Claude remote-control servers (start anything not running)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$CRC_ROOT/bin/crc tick
+EOF
+      cat > "$timer" <<EOF
+[Unit]
+Description=Periodic check that Claude remote-control servers are up
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=${CRC_TICK_INTERVAL:-300}
+Unit=$label.service
+
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl --user daemon-reload
+      systemctl --user enable --now "$label.timer"
+      # Without lingering, user units stop at logout — the Linux twin of the
+      # LaunchAgent problem on macOS.
+      if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+        warn "enable lingering so servers survive logout/reboot:  sudo loginctl enable-linger $(id -un)"
+      fi
+      say "installed systemd user timer $label.timer" ;;
+    uninstall)
+      systemctl --user disable --now "$label.timer" 2>/dev/null || true
+      rm -f "$unit" "$timer"; systemctl --user daemon-reload; say "removed systemd units" ;;
+    status)
+      systemctl --user status "$label.timer" --no-pager 2>/dev/null || say "not installed" ;;
+    *) die "usage: crc supervise <install|uninstall|status>" ;;
+    esac ;;
+  *) die "unsupported OS: $(uname -s)" ;;
+  esac
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    list|ls)      cmd_list "$@" ;;
+    add)          cmd_add "$@" ;;
+    start)        cmd_start "$@" ;;
+    restart)      cmd_restart "$@" ;;
+    stop)         cmd_stop "$@" ;;
+    remove|rm)    cmd_remove "$@" ;;
+    trust)        cmd_trust "$@" ;;
+    revive)       cmd_revive "$@" ;;
+    sessions)     cmd_sessions "$@" ;;
+    tick)         cmd_tick "$@" ;;
+    doctor)       cmd_doctor "$@" ;;
+    supervise)    cmd_supervise "$@" ;;
+    env)          cmd_env "$@" ;;
+    version|-v|--version) say "crc $VERSION" ;;
+    ''|help|-h|--help) usage ;;
+    *) warn "unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
