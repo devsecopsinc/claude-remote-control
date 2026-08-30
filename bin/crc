@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 crc_migrate_legacy
 
@@ -205,25 +205,56 @@ cmd_add() {
 }
 
 # The trust and MCP dialogs are interactive and block server startup until accepted.
-# Drive them once through tmux, then verify the result rather than assuming it worked.
+# Drive them by reading the screen: the option order is NOT stable — some dialogs put
+# "No, exit" first — so pressing Enter blindly can answer the wrong thing.
+tui_pane()   { "$(crc_tmux)" capture-pane -pJ -t "${1}:0.0"; }
+
+# Move the ❯ cursor onto the line matching a pattern, then confirm. Returns 1 if the
+# option never appears, so the caller can stop rather than press keys into the unknown.
+tui_choose() {
+  local session="$1" pattern="$2" tmux cur target delta i
+  tmux="$(crc_tmux)"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    cur="$(tui_pane "$session" | grep -n "❯" | head -1 | cut -d: -f1)"
+    target="$(tui_pane "$session" | grep -n "$pattern" | head -1 | cut -d: -f1)"
+    if [ -z "$cur" ] || [ -z "$target" ]; then sleep 2; continue; fi
+    delta=$((target - cur))
+    if [ "$delta" -eq 0 ]; then "$tmux" send-keys -t "${session}:0.0" Enter; return 0; fi
+    if [ "$delta" -gt 0 ]; then "$tmux" send-keys -t "${session}:0.0" Down
+    else "$tmux" send-keys -t "${session}:0.0" Up; fi
+    sleep 1
+  done
+  return 1
+}
+
 cmd_trust() {
   local name="${1:-}"; [ -n "$name" ] || die "usage: crc trust <name>"
   reg_has "$name" || die "unknown server: $name"
   local dir tmux claude s; dir="$(srv_dir "$name")"
   tmux="$(crc_tmux)"; claude="$(crc_claude)"; s="crc-trust-$$"
+  if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would accept dialogs in $dir"; return 0; fi
+
   say "opening $dir to accept the one-time dialogs…"
   "$tmux" new-session -d -s "$s" -c "$dir"
   sleep 1
   "$tmux" send-keys -t "${s}:0.0" "cd $(printf '%q' "$dir") && $(printf '%q' "$claude")" C-m
-  sleep 9;  "$tmux" send-keys -t "${s}:0.0" Enter   # trust folder
-  sleep 8;  "$tmux" send-keys -t "${s}:0.0" Enter   # approve project MCP servers, if asked
-  sleep 8;  "$tmux" send-keys -t "${s}:0.0" "/exit" C-m
-  sleep 4;  "$tmux" kill-session -t "=$s" 2>/dev/null || true
-  if srv_preflight "$name" >/dev/null; then
-    say "$name: ready"
-  else
-    warn "$name is still not ready. Accept the dialogs by hand:  cd $dir && claude"
+  sleep 10
+
+  if tui_pane "$s" | grep -q "trust this folder"; then
+    tui_choose "$s" "Yes, I trust this folder" || warn "could not select the trust option"
+    sleep 6
   fi
+  if tui_pane "$s" | grep -qi "MCP server"; then
+    tui_choose "$s" "Use this MCP server" || warn "could not select the MCP option"
+    sleep 6
+  fi
+
+  "$tmux" send-keys -t "${s}:0.0" "/exit" C-m
+  sleep 4
+  "$tmux" kill-session -t "=$s" 2>/dev/null || true
+
+  if srv_preflight "$name" >/dev/null; then say "$name: ready"
+  else warn "$name is still not ready. Accept the dialogs by hand:  cd $dir && claude"; return 1; fi
 }
 
 cmd_remove() {
@@ -308,6 +339,23 @@ cmd_sessions() {
   ls -t "$dir/.claude/worktrees" | sed 's/^bridge-//'
 }
 
+# A running server with no environment means session creation is being refused.
+# The usual cause is not local: the repo is missing from the Claude GitHub App's
+# selection, so report it instead of leaving the user to grep a debug log.
+srv_last_failure() {
+  local name="$1" log
+  log="$(crc_log_dir)/rc-$name.log"
+  [ -f "$log" ] || return 1
+  if grep -q "GitHub repository access check failed" "$log" 2>/dev/null; then
+    echo "session creation refused: this repo is not in the Claude GitHub App's selection."
+    echo "                 Link the owner in claude.ai -> Settings -> Connectors -> GitHub, and add the repo at"
+    echo "                 github.com/settings/installations (or the org's Settings -> GitHub Apps -> Claude)."
+    return 0
+  fi
+  grep -oE "Session creation failed with status [0-9]+: .{0,120}" "$log" 2>/dev/null | tail -1 && return 0
+  return 1
+}
+
 cmd_doctor() {
   local ok=0
   say "platform:  $(crc_os) ($(uname -m))"
@@ -328,7 +376,14 @@ cmd_doctor() {
   say ""
   local n why
   for n in $(reg_names); do
-    if why="$(srv_preflight "$n")"; then printf '  %-14s ok (%s)\n' "$n" "$(srv_state "$n")"
+    if why="$(srv_preflight "$n")"; then
+      if [ "$(srv_state "$n")" = running ] && ! srv_env_id "$n" >/dev/null 2>&1; then
+        printf '  %-14s running, NO SESSIONS: ' "$n"
+        srv_last_failure "$n" || echo "cause unknown - see $(crc_log_dir)/rc-$n.log"
+        ok=1
+      else
+        printf '  %-14s ok (%s)\n' "$n" "$(srv_state "$n")"
+      fi
     else printf '  %-14s NOT READY: %s\n' "$n" "$why"; ok=1; fi
   done
   return $ok

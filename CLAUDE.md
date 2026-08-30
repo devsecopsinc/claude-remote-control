@@ -55,6 +55,14 @@ step. Assume every change ships to a running system.
     and only for `crc add --create`. python3 is used for one optional trust check and must
     stay optional.
 
+## Interactive dialogs
+
+`crc trust` drives Claude Code's trust and MCP prompts through tmux. **Never press Enter on a
+timer**: the option order varies between repos (a cloned private repo put `No, exit` first),
+so a blind Enter can answer the opposite of what was intended. Use `tui_choose`, which finds
+the line matching the wanted option, moves the `❯` cursor onto it, and gives up rather than
+sending keys into a dialog it does not recognise.
+
 ## Testing
 
 Never test against the user's live registry:

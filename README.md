@@ -113,11 +113,17 @@ the same trap in different clothing:
 
 - **A workspace must be trusted once** before a server will start there: `crc trust <name>`,
   or `cd <dir> && claude` and accept the dialogs. Otherwise the server exits immediately with
-  `Workspace not trusted`.
-- **Your GitHub account must be linked in claude.ai → Settings → Connectors → GitHub**, for
-  every org that owns a registered repo. Without it every session creation fails with
-  `GitHub repository access check failed`, no session is created, and the workspace's
-  environment id changes on every restart, breaking saved links.
+  `Workspace not trusted`. The dialog's option order is not stable — sometimes `No, exit` is
+  selected first — so `crc trust` reads the screen and moves the cursor onto the option it
+  wants rather than pressing Enter on a timer.
+- **Your GitHub account must be linked in claude.ai → Settings → Connectors → GitHub**, and
+  the repository must be in the Claude GitHub App's selection
+  (`github.com/settings/installations`, or the org's Settings → GitHub Apps → Claude).
+  Without it every session creation fails with `GitHub repository access check failed`: the
+  server still starts and reports `Ready`, but stays at `0/32` sessions forever and mints a
+  new environment id on every restart, breaking saved links. `crc doctor` reports this as
+  `running, NO SESSIONS` and names the cause — it is the first thing to check when a server
+  looks healthy but nothing works.
 - **Stopping a server does not deregister its environment** (it is kept so sessions can
   resume), so repeatedly recreating servers leaves ghost entries in the app that cannot be
   cleaned up from the CLI. Prefer `crc restart` over remove/add, and open workspaces by the
