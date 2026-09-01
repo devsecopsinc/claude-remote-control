@@ -63,6 +63,18 @@ so a blind Enter can answer the opposite of what was intended. Use `tui_choose`,
 the line matching the wanted option, moves the `❯` cursor onto it, and gives up rather than
 sending keys into a dialog it does not recognise.
 
+## Verifying a start
+
+`srv_start` must confirm the process is up *and still up* a moment later (`srv_wait_settled`).
+A command that dies immediately still appears in `pgrep` for an instant, so "it appeared once"
+is not evidence it started. Do not report success from having sent keystrokes into tmux.
+
+When testing failure paths, remember the watchdog: it starts registered servers every 5
+minutes and will repair the very failure you are trying to observe. Use a scratch `CRC_HOME`
+whose servers the supervisor does not know about. Also note macOS has `/usr/bin/false`, not
+`/bin/false` — a non-existent override binary used to fall back silently and invalidate the
+test; `crc_find` now refuses an override that is not executable.
+
 ## Testing
 
 Never test against the user's live registry:

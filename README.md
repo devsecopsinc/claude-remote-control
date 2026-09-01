@@ -48,6 +48,9 @@ Works on macOS (launchd) and Linux (systemd user timer). Requirements: `bash`, `
     crc revive cse_01ABC…           # reattach one; it finds the owning workspace
     crc doctor                      # tools, registry, per-server readiness
 
+A failed start is reported as such: `crc start` / `crc restart` wait for the server process
+to come up and stay up, retry once, and exit non-zero if it does not.
+
 `CRC_DRY_RUN=1` makes any command print what it would do and change nothing.
 
 ## The registry

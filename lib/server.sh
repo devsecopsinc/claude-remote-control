@@ -81,11 +81,47 @@ srv_start() {
 
   if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] $session: $cmd"; return 0; fi
 
-  "$tmux" new-session -d -s "$session" -c "$dir"
-  sleep 1
-  "$tmux" send-keys -t "${session}:0.0" "$cmd" C-m
-  crc_log "$name started in $dir"
-  say "$name: started"
+  # Launch, then confirm the process actually came up. Firing keys into tmux and
+  # assuming success once reported "started" for a server that never appeared.
+  local attempt
+  for attempt in 1 2; do
+    "$tmux" kill-session -t "=$session" 2>/dev/null || true
+    "$tmux" new-session -d -s "$session" -c "$dir"
+    sleep 1
+    "$tmux" send-keys -t "${session}:0.0" "$cmd" C-m
+    if srv_wait_settled "$name" 15; then
+      crc_log "$name started in $dir (attempt $attempt)"
+      say "$name: started"
+      return 0
+    fi
+    crc_log "$name did not come up on attempt $attempt"
+  done
+  warn "$name: failed to start — see $logdir/rc-$name.log and 'tmux attach -t $session'"
+  crc_log "$name failed to start"
+  return 1
+}
+
+# Wait for a server process to appear, up to N seconds. Returns as soon as it does,
+# so the healthy path costs about a second.
+srv_wait_running() {
+  local name="$1" secs="${2:-15}" i=0
+  while [ "$i" -lt "$secs" ]; do
+    srv_running "$name" && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Appearing is not enough: a command that dies immediately still shows up in pgrep
+# for an instant. Require the process to be alive with the same pid a moment later.
+srv_wait_settled() {
+  local name="$1" secs="${2:-15}" first second
+  srv_wait_running "$name" "$secs" || return 1
+  first="$(srv_pids "$name" | head -1)"
+  sleep 3
+  second="$(srv_pids "$name" | head -1)"
+  [ -n "$second" ] && [ "$first" = "$second" ]
 }
 
 srv_stop() {

@@ -14,7 +14,12 @@ crc_os() {
 # The supervisor runs with a minimal PATH, so nothing here may assume a login shell.
 crc_find() {
   local var_override="$1"; shift
-  if [ -n "$var_override" ] && [ -x "$var_override" ]; then echo "$var_override"; return 0; fi
+  if [ -n "$var_override" ]; then
+    # An explicit override that does not exist is a mistake, not a hint: falling back
+    # silently would run a different binary than the one asked for.
+    [ -x "$var_override" ] || { echo "override '$var_override' is not executable" >&2; return 2; }
+    echo "$var_override"; return 0
+  fi
   local c
   for c in "$@"; do
     if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return 0; fi
