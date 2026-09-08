@@ -45,7 +45,7 @@ Works on macOS (launchd) and Linux (systemd user timer). Requirements: `bash`, `
     crc remove work --purge         # delete it; --keep-dir to keep it
 
     crc sessions work               # chat sessions that can be revived, newest first
-    crc revive cse_01ABC…           # reattach one; it finds the owning workspace
+    crc revive cse_01ABC…           # reattach one, in its own worktree and branch
     crc doctor                      # tools, registry, per-server readiness
 
 A failed start is reported as such: `crc start` / `crc restart` wait for the server process
@@ -132,7 +132,9 @@ the same trap in different clothing:
   cleaned up from the CLI. Prefer `crc restart` over remove/add, and open workspaces by the
   `crc env` URL rather than by picking from a list of same-named entries.
 - **Old chats do not auto-resume** after a restart. They are on disk: `crc sessions <name>`
-  then `crc revive <id>`.
+  then `crc revive <id>`, which puts the chat back in **its own worktree, on its own branch**,
+  where its uncommitted work is. If that worktree has been removed, revive falls back to the
+  repo root and says so — the conversation returns but its branch and working tree do not.
 - **`--session-id` cannot be combined with `--spawn`**, so a revived chat runs as its own
   single-session server and exits when the chat ends.
 - **Auto mode's classifier can still block commands even in `bypassPermissions`**, because
