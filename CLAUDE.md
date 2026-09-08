@@ -55,6 +55,13 @@ step. Assume every change ships to a running system.
     and only for `crc add --create`. python3 is used for one optional trust check and must
     stay optional.
 
+## Worktrees belong to sessions
+
+A chat's branch and uncommitted work live in `<repo>/.claude/worktrees/bridge-<sid>`, not in
+the repo root. Anything that resumes a session (`crc revive`) must `cd` into that worktree —
+resuming from the root hands the conversation back on the default branch with its work
+invisible, which is worse than not resuming at all because it looks like it worked.
+
 ## Interactive dialogs
 
 `crc trust` drives Claude Code's trust and MCP prompts through tmux. **Never press Enter on a

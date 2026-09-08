@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.2.3"
+VERSION="1.2.4"
 
 crc_migrate_legacy
 
@@ -306,28 +306,43 @@ cmd_remove() {
 # Old chats survive a server restart but do not resume by themselves: they need a
 # process. --session-id runs one session and exits, and cannot be combined with --spawn.
 cmd_revive() {
-  local sid="${1:-}" name="${2:-}" dir tmux claude session
+  local sid="${1:-}" name="${2:-}" repo dir tmux claude session git branch
   [ -n "$sid" ] || die "usage: crc revive <session-id> [server]   (ids: crc sessions <server>)"
   case "$sid" in bridge-cse_*) sid="cse_${sid#bridge-cse_}" ;; esac
+  git="$(crc_git)"
   if [ -n "$name" ]; then
     reg_has "$name" || die "unknown server: $name"
-    dir="$(srv_dir "$name")"
+    repo="$(srv_dir "$name")"
   else
     # Find which registered workspace owns this session's worktree.
     local n d
     for n in $(reg_names); do
       d="$(srv_dir "$n" 2>/dev/null || echo '')"
-      [ -n "$d" ] && [ -d "$d/.claude/worktrees/bridge-$sid" ] && { dir="$d"; name="$n"; break; }
+      [ -n "$d" ] && [ -d "$d/.claude/worktrees/bridge-$sid" ] && { repo="$d"; name="$n"; break; }
     done
-    [ -n "${dir:-}" ] || die "no registered workspace owns $sid — pass the server name explicitly"
+    [ -n "${repo:-}" ] || die "no registered workspace owns $sid — pass the server name explicitly"
   fi
+
+  # Resume inside the session's own worktree, not the repo root. The chat's branch and
+  # its uncommitted work live there; resuming in the root hands the conversation back
+  # pointed at the default branch, with everything it did nowhere in sight.
+  dir="$repo/.claude/worktrees/bridge-$sid"
+  if [ -d "$dir" ]; then
+    branch="$("$git" -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    say "resuming in its worktree: $dir (branch $branch)"
+  else
+    dir="$repo"
+    branch="$("$git" -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    warn "no worktree left for $sid — resuming in $repo on branch $branch; its original branch and any uncommitted work are not here"
+  fi
+
   tmux="$(crc_tmux)"; claude="$(crc_claude)"; session="rev-$(printf '%s' "$sid" | cut -c5-12)"
   if "$tmux" has-session -t "=$session" 2>/dev/null; then say "$session already running"; return 0; fi
-  if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would revive $sid in $dir"; return 0; fi
+  if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would revive $sid in $dir (branch $branch)"; return 0; fi
   "$tmux" new-session -d -s "$session" -c "$dir"
   sleep 1
   "$tmux" send-keys -t "${session}:0.0" "cd $(printf '%q' "$dir") && $(printf '%q' "$claude") remote-control --session-id $sid" C-m
-  crc_log "revived $sid ($name)"
+  crc_log "revived $sid ($name) in $dir"
   say "revived $sid in tmux session $session"
 }
 
