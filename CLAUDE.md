@@ -6,7 +6,7 @@ Read `README.md` for the user-facing picture before changing code.
 
 ## Layout
 
-    bin/crc            CLI: list add start restart stop remove trust sessions revive tick doctor supervise env
+    bin/crc            CLI: list add start restart restart-session stop remove trust sessions revive tick doctor supervise env
     lib/platform.sh    OS detection, tool discovery, paths, network probe
     lib/registry.sh    INI read/write (awk; no dependencies)
     lib/server.sh      one server's lifecycle: preflight, start, stop, state, env id

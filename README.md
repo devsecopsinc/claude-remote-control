@@ -46,6 +46,7 @@ Works on macOS (launchd) and Linux (systemd user timer). Requirements: `bash`, `
 
     crc sessions work               # chat sessions that can be revived, newest first
     crc revive cse_01ABC…           # reattach one, in its own worktree and branch
+    crc restart-session cse_01ABC…  # restart one live chat; its server and other chats keep running
     crc doctor                      # tools, registry, per-server readiness
 
 A failed start is reported as such: `crc start` / `crc restart` wait for the server process
@@ -135,6 +136,11 @@ the same trap in different clothing:
   then `crc revive <id>`, which puts the chat back in **its own worktree, on its own branch**,
   where its uncommitted work is. If that worktree has been removed, revive falls back to the
   repo root and says so — the conversation returns but its branch and working tree do not.
+- **One chat can be restarted without its server.** Each live chat is its own process;
+  `crc restart-session <cse_id>` stops it (refusing if it is mid-turn, unless `--force`), and
+  the next message sent to that chat makes the server resume it in the same worktree. This is
+  how a chat picks up startup-time config such as a new `.mcp.json`. It usually returns within
+  seconds, but can take a couple of minutes.
 - **`--session-id` cannot be combined with `--spawn`**, so a revived chat runs as its own
   single-session server and exits when the chat ends.
 - **Auto mode's classifier can still block commands even in `bypassPermissions`**, because
