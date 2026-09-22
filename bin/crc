@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.2.4"
+VERSION="1.3.0"
 
 crc_migrate_legacy
 
@@ -34,6 +34,7 @@ usage: crc <command> [args]
   add <name> [options]          register a workspace and start its server
   start [name...|--all]         start servers that are not running
   restart <name...|--all>       restart named servers (others are untouched)
+  restart-session <session-id>  restart one chat; the rest of its server keeps running
   stop <name...|--all>          stop servers
   remove <name> [--purge]       stop, unregister, optionally delete the directory
   trust <name>                  accept the one-time workspace/MCP dialogs
@@ -346,6 +347,65 @@ cmd_revive() {
   say "revived $sid in tmux session $session"
 }
 
+# Restart one live chat without touching its server or the other chats. Each chat is its
+# own child process (--session-id cse_…). When it exits the server releases the chat, and
+# the next message sent to it makes the server spawn it again with --resume, in the same
+# worktree. That is also how it picks up config read at startup, such as a new .mcp.json.
+cmd_restart_session() {
+  local sid="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) sid="$1"; shift ;;
+    esac
+  done
+  [ -n "$sid" ] || die "usage: crc restart-session <session-id> [--force]   (e.g. cse_01ABC…)"
+  case "$sid" in bridge-cse_*) sid="cse_${sid#bridge-cse_}" ;; esac
+
+  # The trailing space keeps cse_01AB from matching cse_01ABC.
+  local pid; pid="$(pgrep -f -- "--session-id $sid " 2>/dev/null | head -1)"
+  [ -n "$pid" ] || die "$sid is not running on this machine — it is either stopped already (send it a message) or belongs to another host"
+
+  local args log server="?" n
+  args="$(ps -o command= -p "$pid" 2>/dev/null)"
+  log="$(printf '%s\n' "$args" | sed -n 's/.*--debug-file \([^ ]*\).*/\1/p')"
+  for n in $(reg_names); do
+    srv_pids "$n" | grep -qx "$(ps -o ppid= -p "$pid" | tr -d ' ')" && { server="$n"; break; }
+  done
+
+  # Refuse to cut a chat off mid-turn. A turn is in progress when the last model request
+  # the chat made (source=sdk; side queries run after a turn ends) is newer than the last
+  # "turn N end" line.
+  if [ "$force" = 0 ]; then
+    local state=unknown
+    if [ -n "$log" ] && [ -f "$log" ]; then
+      state="$(awk '/\[engine\] turn [0-9]+ end/{e=NR} /API REQUEST\] \/v1\/messages .*source=sdk/{r=NR}
+                   END{ if (r > e) print "busy"; else print "idle" }' "$log")"
+    fi
+    case "$state" in
+      busy)    die "$sid is in the middle of a turn — wait for it to finish, or pass --force" ;;
+      unknown) die "cannot tell whether $sid is mid-turn (no debug log) — pass --force to restart anyway" ;;
+    esac
+  fi
+
+  if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would stop $sid (pid $pid, server $server)"; return 0; fi
+
+  kill -TERM "$pid" 2>/dev/null || die "could not signal pid $pid"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    warn "$sid did not exit on SIGTERM; killed"
+  fi
+  crc_log "restart-session $sid (pid $pid, server $server)"
+  say "$sid: stopped (pid $pid, server $server)"
+  say "send the chat any message to bring it back — it resumes in the same worktree, usually within seconds, occasionally a couple of minutes"
+}
+
 # List revivable chat sessions for a server, newest first.
 cmd_sessions() {
   local name="${1:-}" dir
@@ -506,6 +566,7 @@ main() {
     add)          cmd_add "$@" ;;
     start)        cmd_start "$@" ;;
     restart)      cmd_restart "$@" ;;
+    restart-session) cmd_restart_session "$@" ;;
     stop)         cmd_stop "$@" ;;
     remove|rm)    cmd_remove "$@" ;;
     trust)        cmd_trust "$@" ;;
