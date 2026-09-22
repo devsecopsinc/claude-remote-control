@@ -39,7 +39,8 @@ usage: crc <command> [args]
   remove <name> [--purge]       stop, unregister, optionally delete the directory
   trust <name>                  accept the one-time workspace/MCP dialogs
   sessions <name>               list revivable chat sessions, newest first
-  revive <session-id> [name]    reattach an old chat session
+  revive <session-id> [server] [--branch <name>]
+                                reattach an old chat, restoring its worktree if gone
   tick                          what the supervisor runs: start anything missing
   doctor                        check tools, registry and per-server readiness
   supervise <install|uninstall|status>
@@ -304,22 +305,82 @@ cmd_remove() {
   crc_log "$name removed (purge=$purge)"
 }
 
+# Claude Code keeps a directory's transcripts under ~/.claude/projects, in a directory
+# named after the path with every / . and _ replaced by a dash.
+crc_project_dir() {
+  printf '%s/.claude/projects/%s\n' "$HOME" "$(printf '%s' "$1" | sed 's|[/._]|-|g')"
+}
+
+# The branch a chat was last on, read from the newest transcript written for its worktree.
+# The worktree may be gone; the transcripts outlive it, and every entry records gitBranch.
+revive_last_branch() {
+  local proj f b
+  proj="$(crc_project_dir "$1")"
+  [ -d "$proj" ] || return 1
+  f="$(ls -t "$proj"/*.jsonl 2>/dev/null | head -1)"
+  [ -n "$f" ] || return 1
+  b="$(grep -o '"gitBranch":"[^"]*"' "$f" 2>/dev/null | tail -1 | cut -d'"' -f4)"
+  [ -n "$b" ] || return 1
+  printf '%s\n' "$b"
+}
+
+# Put a deleted chat worktree back at its old path, on the branch the chat was using.
+# Newer Claude Code versions delete a chat's worktree on shutdown once it is clean and
+# not ahead of its base, so a chat that resumed fine last month can come back to nothing.
+revive_restore_worktree() {
+  local git="$1" repo="$2" dir="$3" branch="$4" out
+  if "$git" -C "$repo" rev-parse --verify -q "refs/heads/$branch" >/dev/null; then
+    # A branch checked out in another worktree cannot be checked out again: take it
+    # detached rather than refusing, so the chat still gets its own tree and history.
+    if out="$("$git" -C "$repo" worktree add "$dir" "$branch" 2>&1)"; then
+      say "restored its worktree on branch $branch"
+    elif out="$("$git" -C "$repo" worktree add --detach "$dir" "$branch" 2>&1)"; then
+      warn "branch $branch is checked out elsewhere — restored the worktree detached at $branch"
+    else
+      warn "could not restore the worktree: $out"; return 1
+    fi
+  elif "$git" -C "$repo" rev-parse --verify -q "refs/remotes/origin/$branch" >/dev/null; then
+    out="$("$git" -C "$repo" worktree add -b "$branch" "$dir" "origin/$branch" 2>&1)" \
+      || { warn "could not restore the worktree: $out"; return 1; }
+    say "restored its worktree from origin/$branch (the local branch was gone)"
+  else
+    out="$("$git" -C "$repo" worktree add -b "$branch" "$dir" HEAD 2>&1)" \
+      || { warn "could not restore the worktree: $out"; return 1; }
+    warn "branch $branch no longer exists anywhere — created it fresh at $repo HEAD;"
+    warn "the chat gets its own tree again, but not whatever it had built there"
+  fi
+  # The bridge locks chat worktrees; match it, so a prune does not collect this one.
+  "$git" -C "$repo" worktree lock "$dir" 2>/dev/null || true
+  return 0
+}
+
 # Old chats survive a server restart but do not resume by themselves: they need a
 # process. --session-id runs one session and exits, and cannot be combined with --spawn.
 cmd_revive() {
-  local sid="${1:-}" name="${2:-}" repo dir tmux claude session git branch
-  [ -n "$sid" ] || die "usage: crc revive <session-id> [server]   (ids: crc sessions <server>)"
+  local sid="" name="" want_branch="" repo dir tmux claude session git branch
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch) want_branch="${2:-}"; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) if [ -z "$sid" ]; then sid="$1"; else name="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$sid" ] || die "usage: crc revive <session-id> [server] [--branch <name>]   (ids: crc sessions <server>)"
   case "$sid" in bridge-cse_*) sid="cse_${sid#bridge-cse_}" ;; esac
   git="$(crc_git)"
   if [ -n "$name" ]; then
     reg_has "$name" || die "unknown server: $name"
     repo="$(srv_dir "$name")"
   else
-    # Find which registered workspace owns this session's worktree.
+    # Find which registered workspace owns this session. Its worktree may be gone, so
+    # accept the transcripts Claude Code keeps for that worktree path as proof too.
     local n d
     for n in $(reg_names); do
       d="$(srv_dir "$n" 2>/dev/null || echo '')"
-      [ -n "$d" ] && [ -d "$d/.claude/worktrees/bridge-$sid" ] && { repo="$d"; name="$n"; break; }
+      [ -n "$d" ] || continue
+      if [ -d "$d/.claude/worktrees/bridge-$sid" ] || [ -d "$(crc_project_dir "$d/.claude/worktrees/bridge-$sid")" ]; then
+        repo="$d"; name="$n"; break
+      fi
     done
     [ -n "${repo:-}" ] || die "no registered workspace owns $sid — pass the server name explicitly"
   fi
@@ -332,9 +393,20 @@ cmd_revive() {
     branch="$("$git" -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
     say "resuming in its worktree: $dir (branch $branch)"
   else
-    dir="$repo"
-    branch="$("$git" -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-    warn "no worktree left for $sid — resuming in $repo on branch $branch; its original branch and any uncommitted work are not here"
+    # The worktree is gone. Rebuild it on the chat's own branch rather than dropping the
+    # conversation into the repo root on the default branch, where nothing it did is.
+    branch="$want_branch"
+    [ -n "$branch" ] || branch="$(revive_last_branch "$dir" || echo "worktree-bridge-$sid")"
+    if [ "${CRC_DRY_RUN:-0}" = 1 ]; then
+      say "[dry-run] would restore $dir on branch $branch, then revive $sid there"
+      return 0
+    fi
+    say "no worktree left for $sid — restoring it on branch $branch"
+    if ! revive_restore_worktree "$git" "$repo" "$dir" "$branch"; then
+      dir="$repo"
+      branch="$("$git" -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+      warn "falling back to $repo on branch $branch; the chat's own branch is not here"
+    fi
   fi
 
   tmux="$(crc_tmux)"; claude="$(crc_claude)"; session="rev-$(printf '%s' "$sid" | cut -c5-12)"
