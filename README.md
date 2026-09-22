@@ -46,6 +46,7 @@ Works on macOS (launchd) and Linux (systemd user timer). Requirements: `bash`, `
 
     crc sessions work               # chat sessions that can be revived, newest first
     crc revive cse_01ABC…           # reattach one, in its own worktree and branch
+    crc revive cse_01ABC… --branch x  # ...on a branch you name instead
     crc restart-session cse_01ABC…  # restart one live chat; its server and other chats keep running
     crc doctor                      # tools, registry, per-server readiness
 
@@ -134,8 +135,11 @@ the same trap in different clothing:
   `crc env` URL rather than by picking from a list of same-named entries.
 - **Old chats do not auto-resume** after a restart. They are on disk: `crc sessions <name>`
   then `crc revive <id>`, which puts the chat back in **its own worktree, on its own branch**,
-  where its uncommitted work is. If that worktree has been removed, revive falls back to the
-  repo root and says so — the conversation returns but its branch and working tree do not.
+  where its uncommitted work is. Newer Claude Code versions delete a chat's worktree on
+  shutdown once it is clean and not ahead of its base; revive then **rebuilds the worktree
+  on the branch the chat was last using**, read from that chat's transcripts. If the branch
+  is gone too it is recreated at the repo's HEAD, and revive says so. `--branch <name>`
+  overrides the branch it picks.
 - **One chat can be restarted without its server.** Each live chat is its own process;
   `crc restart-session <cse_id>` stops it (refusing if it is mid-turn, unless `--force`), and
   the next message sent to that chat makes the server resume it in the same worktree. This is
