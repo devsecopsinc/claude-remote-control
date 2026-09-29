@@ -48,12 +48,40 @@ Works on macOS (launchd) and Linux (systemd user timer). Requirements: `bash`, `
     crc revive cse_01ABC…           # reattach one, in its own worktree and branch
     crc revive cse_01ABC… --branch x  # ...on a branch you name instead
     crc restart-session cse_01ABC…  # restart one live chat; its server and other chats keep running
+    crc login                       # sign this machine in: prints a URL, takes the code
+    crc login status --json         # what a remote client polls
     crc doctor                      # tools, registry, per-server readiness
 
 A failed start is reported as such: `crc start` / `crc restart` wait for the server process
 to come up and stay up, retry once, and exit non-zero if it does not.
 
 `CRC_DRY_RUN=1` makes any command print what it would do and change nothing.
+
+## Signing in
+
+A headless box cannot read a locked login keychain, so Claude Code keeps its tokens in
+`~/.claude/.credentials.json`. When a refresh fails that record is left empty, and every
+chat on the machine dies with `OAuth session expired and could not be refreshed`. Nothing
+recovers on its own, and `/login` does not exist inside a remote-control session.
+
+    crc login                 # prints a URL, waits for the code, restarts the servers
+    crc login --no-restart    # ...leave the servers alone
+
+The sign-in needs a browser and a code pasted back, so it cannot be fully automated. The
+steps are also separate commands, so something else — a phone, a small local web service —
+can drive the same flow without holding a terminal open:
+
+    crc login start [--json]  # {"url": "https://claude.com/cai/oauth/authorize?..."}
+    crc login code <code>     # completes it, then restarts the servers
+    crc login status [--json] # {"state":"ok","expires_at":…,"refresh_token":true,…}
+    crc login cancel
+
+`start` is idempotent: while a flow is open it hands back the same URL rather than
+beginning a second sign-in. `crc doctor` reports the same credential state, including
+the empty-record case, so a broken token shows up before every server does.
+
+New credentials are only read at process start, which is why logging in restarts the
+servers — and interrupts every live chat. That is unavoidable, not an oversight.
 
 ## The registry
 

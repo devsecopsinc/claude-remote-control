@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 crc_migrate_legacy
 
@@ -38,6 +38,8 @@ usage: crc <command> [args]
   stop <name...|--all>          stop servers
   remove <name> [--purge]       stop, unregister, optionally delete the directory
   trust <name>                  accept the one-time workspace/MCP dialogs
+  login [start|code <c>|status|cancel]
+                                sign this machine in to Claude, then restart servers
   sessions <name>               list revivable chat sessions, newest first
   revive <session-id> [server] [--branch <name>]
                                 reattach an old chat, restoring its worktree if gone
@@ -488,6 +490,239 @@ cmd_sessions() {
   ls -t "$dir/.claude/worktrees" | sed 's/^bridge-//'
 }
 
+# ---------------------------------------------------------------------------
+# Authentication.
+#
+# A headless box cannot read a locked login keychain, so Claude Code falls back
+# to ~/.claude/.credentials.json. When a refresh fails, that record is left with
+# no tokens at all and every chat on the machine dies with "OAuth session expired
+# and could not be refreshed" — there is nothing to recover from and no way to log
+# in from inside a remote-control session (/login is not available there).
+#
+# The flow is a browser sign-in plus a code pasted back, so it cannot be fully
+# automated. It is split into start/code/cancel so something else — a phone, a
+# small local web service — can drive it without holding a terminal open:
+#
+#   crc login start          prints the URL to open
+#   crc login code <code>    completes it and restarts the servers
+#
+# Both steps talk to one tmux session running the real CLI. Driving the CLI beats
+# reimplementing the OAuth exchange: the token endpoint and the credential file
+# are undocumented, and a change in either would lock the machine out completely.
+
+CRC_LOGIN_SESSION="crc-login"
+
+# Credential health, printed as: state expires_epoch refresh subscription
+# States: ok | expiring | expired | empty (record with no tokens) | missing | unknown
+auth_status() {
+  local f="$HOME/.claude/.credentials.json"
+  [ -f "$f" ] || { echo "missing 0 no -"; return 1; }
+  command -v python3 >/dev/null 2>&1 || { echo "unknown 0 ? -"; return 0; }
+  python3 - "$f" <<'PY'
+import json, sys, time
+try:
+    o = (json.load(open(sys.argv[1])) or {}).get("claudeAiOauth") or {}
+except Exception:
+    print("unknown 0 ? -"); sys.exit(0)
+exp = int(o.get("expiresAt") or 0) // 1000
+refresh = "yes" if o.get("refreshToken") else "no"
+sub = o.get("subscriptionType") or "-"
+if not o.get("accessToken"):
+    print("empty 0 %s %s" % (refresh, sub)); sys.exit(1)
+left = exp - time.time()
+# With a refresh token an expiring access token is normal; without one, expiry is
+# the end of the line, so warn early enough to do something about it.
+if left <= 0:
+    state = "expired"
+elif refresh == "no" and left < 86400:
+    state = "expiring"
+else:
+    state = "ok"
+print("%s %d %s %s" % (state, exp, refresh, sub))
+sys.exit(0 if state in ("ok", "expiring") else 1)
+PY
+}
+
+auth_report() {
+  local s; s="$(auth_status)"; local rc=$?
+  local state exp refresh sub; read -r state exp refresh sub <<EOF
+$s
+EOF
+  case "$state" in
+    ok|expiring)
+      local when="unknown"
+      [ "$exp" != 0 ] && when="$(date -r "$exp" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$exp")"
+      say "auth:      $sub, token valid until $when, refresh token: $refresh" ;;
+    expired)  warn "auth:      token expired and cannot refresh (refresh token: $refresh) — run 'crc login'" ;;
+    empty)    warn "auth:      credential record has no tokens — a refresh failed; run 'crc login'" ;;
+    missing)  warn "auth:      no credentials file — run 'crc login'" ;;
+    *)        say  "auth:      ~/.claude/.credentials.json (state unknown: python3 not found)" ;;
+  esac
+  return $rc
+}
+
+# claude asks a one-time trust question in an unknown directory, and that question
+# would swallow the keystrokes meant for the login prompt. Run from a workspace
+# that has already answered it.
+login_dir() {
+  local n d
+  for n in $(reg_names); do
+    d="$(srv_dir "$n" 2>/dev/null || echo '')"
+    [ -n "$d" ] && [ -d "$d" ] && srv_preflight "$n" >/dev/null 2>&1 && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+login_wait_for() {
+  local s="$1" pat="$2" secs="${3:-60}" i=0
+  while [ "$i" -lt "$secs" ]; do
+    tui_pane "$s" 2>/dev/null | grep -qE "$pat" && return 0
+    sleep 1; i=$((i + 1))
+  done
+  return 1
+}
+
+login_url() { tui_pane "$1" 2>/dev/null | grep -oE 'https://claude\.(com|ai)/[^ ]*oauth[^ ]*' | tail -1; }
+
+login_start() {
+  local tmux claude dir s="$CRC_LOGIN_SESSION" url
+  tmux="$(crc_tmux)" || die "tmux not found"
+  claude="$(crc_claude)" || die "claude not found"
+  dir="$(login_dir)" || die "no trusted workspace to log in from — run 'crc trust <name>' first"
+
+  # An already-running flow still has a usable URL: hand back the same one rather
+  # than starting a second sign-in the user did not ask for.
+  if "$tmux" has-session -t "=$s" 2>/dev/null; then
+    url="$(login_url "$s")"
+    [ -n "$url" ] && { printf '%s\n' "$url"; return 0; }
+    "$tmux" kill-session -t "=$s" 2>/dev/null || true
+  fi
+
+  # A very wide window keeps the URL on one line. At a normal width the login screen
+  # wraps it across six lines, and a wrapped URL cannot be reassembled reliably; the
+  # URL runs past 450 characters, so this has to be wider than it looks reasonable.
+  "$tmux" new-session -d -s "$s" -x 1000 -y 50 -c "$dir"
+  sleep 1
+  "$tmux" send-keys -t "${s}:0.0" "cd $(printf '%q' "$dir") && $(printf '%q' "$claude")" C-m
+  login_wait_for "$s" 'auto mode|bypass permissions|shift\+tab' 120 \
+    || warn "claude is slow to start; continuing"
+  "$tmux" send-keys -t "${s}:0.0" "/login" C-m
+  login_wait_for "$s" 'Select login method' 60 \
+    || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "the login screen did not appear"; }
+  # Match the option line itself: the blurb above it also says "subscription",
+  # and aiming the cursor at that line walks it the wrong way until it gives up.
+  tui_choose "$s" "Claude account with subscription" \
+    || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "could not select the subscription login option"; }
+  login_wait_for "$s" 'oauth/authorize' 60 \
+    || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "no login URL appeared"; }
+  url="$(login_url "$s")"
+  [ -n "$url" ] || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "could not read the login URL from the screen"; }
+  crc_log "login flow started"
+  printf '%s\n' "$url"
+}
+
+login_code() {
+  local code="$1" s="$CRC_LOGIN_SESSION" tmux
+  tmux="$(crc_tmux)"
+  "$tmux" has-session -t "=$s" 2>/dev/null || die "no login in progress — run 'crc login start' first"
+  # -l sends the code literally: it contains a # and must not be read as a key name.
+  "$tmux" send-keys -t "${s}:0.0" -l "$code"
+  sleep 1
+  "$tmux" send-keys -t "${s}:0.0" Enter
+  if ! login_wait_for "$s" 'Login successful|Logged in as' 120; then
+    warn "login did not complete. The screen says:"
+    tui_pane "$s" | grep -v '^$' | tail -8 >&2
+    return 1
+  fi
+  "$tmux" send-keys -t "${s}:0.0" Enter; sleep 2
+  "$tmux" send-keys -t "${s}:0.0" "/exit" C-m; sleep 3
+  "$tmux" kill-session -t "=$s" 2>/dev/null || true
+  auth_status >/dev/null || die "claude reported success but wrote no usable credentials"
+  crc_log "login completed"
+  return 0
+}
+
+login_cancel() {
+  local tmux; tmux="$(crc_tmux)"
+  if "$tmux" has-session -t "=$CRC_LOGIN_SESSION" 2>/dev/null; then
+    "$tmux" kill-session -t "=$CRC_LOGIN_SESSION"; say "login flow cancelled"
+  else
+    say "no login in progress"
+  fi
+}
+
+cmd_login() {
+  local sub="" code="" json=0 restart=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)       json=1; shift ;;
+      --no-restart) restart=0; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) if [ -z "$sub" ]; then sub="$1"; else code="$1"; fi; shift ;;
+    esac
+  done
+
+  case "$sub" in
+  status)
+    local s; s="$(auth_status)"; local rc=$?
+    if [ "$json" = 1 ]; then
+      local state exp refresh subs; read -r state exp refresh subs <<EOF
+$s
+EOF
+      local pending=false
+      "$(crc_tmux)" has-session -t "=$CRC_LOGIN_SESSION" 2>/dev/null && pending=true
+      printf '{"state":"%s","expires_at":%s,"refresh_token":%s,"subscription":"%s","login_in_progress":%s}\n' \
+        "$state" "$exp" "$( [ "$refresh" = yes ] && echo true || echo false )" "$subs" "$pending"
+    else
+      auth_report
+    fi
+    return $rc ;;
+  start)
+    local url; url="$(login_start)" || return 1
+    if [ "$json" = 1 ]; then printf '{"url":"%s"}\n' "$url"
+    else
+      say "Open this URL, approve, then run:  crc login code <code>"
+      say ""
+      say "$url"
+    fi
+    return 0 ;;
+  code)
+    [ -n "$code" ] || die "usage: crc login code <code>"
+    login_code "$code" || return 1
+    say "logged in"
+    auth_report
+    [ "$restart" = 1 ] && login_restart
+    return 0 ;;
+  cancel) login_cancel; return 0 ;;
+  "")     ;;                      # interactive flow, below
+  *)      die "usage: crc login [start|code <code>|status|cancel] [--json] [--no-restart]" ;;
+  esac
+
+  # Interactive: one command, from URL to restarted servers.
+  local url; url="$(login_start)" || return 1
+  say "Open this URL and approve, then paste the code back here:"
+  say ""
+  say "$url"
+  say ""
+  printf 'code: '
+  local entered; read -r entered
+  [ -n "$entered" ] || { login_cancel; die "no code entered"; }
+  login_code "$entered" || return 1
+  say "logged in"
+  auth_report
+  [ "$restart" = 1 ] && login_restart
+  return 0
+}
+
+# New credentials are read at process start, so running chats keep failing until
+# their server is restarted. Say what that costs before doing it.
+login_restart() {
+  local live; live="$(pgrep -f 'sdk-url' 2>/dev/null | wc -l | tr -d ' ')"
+  say ""
+  say "restarting all servers so they pick up the new credentials (${live:-0} chat session(s) will be interrupted)"
+  cmd_restart --all
+}
+
 # A running server with no environment means session creation is being refused.
 # The usual cause is not local: the repo is missing from the Claude GitHub App's
 # selection, so report it instead of leaving the user to grep a debug log.
@@ -518,9 +753,9 @@ cmd_doctor() {
   [ "$t" = MISSING ] && { warn "tmux is required"; ok=1; }
   [ "$c" = MISSING ] && { warn "claude is required"; ok=1; }
 
-  # Credentials: a headless box cannot read a locked login keychain.
-  if [ -f "$HOME/.claude/.credentials.json" ]; then say "auth:      ~/.claude/.credentials.json"
-  else warn "auth:      no credentials file — run 'claude' once and sign in, or remote sessions will not register"; fi
+  # Credentials: a headless box cannot read a locked login keychain, and a failed
+  # refresh empties the record, taking every chat on the machine down with it.
+  auth_report || ok=1
 
   say ""
   local n why
@@ -642,6 +877,7 @@ main() {
     stop)         cmd_stop "$@" ;;
     remove|rm)    cmd_remove "$@" ;;
     trust)        cmd_trust "$@" ;;
+    login)        cmd_login "$@" ;;
     revive)       cmd_revive "$@" ;;
     sessions)     cmd_sessions "$@" ;;
     tick)         cmd_tick "$@" ;;
