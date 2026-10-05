@@ -6,10 +6,12 @@ Read `README.md` for the user-facing picture before changing code.
 
 ## Layout
 
-    bin/crc            CLI: list add start restart restart-session stop remove login trust sessions revive tick doctor supervise env
+    bin/crc            CLI: list add start restart restart-session stop remove login account fork handoff trust sessions revive tick doctor supervise env
     lib/platform.sh    OS detection, tool discovery, paths, network probe
     lib/registry.sh    INI read/write (awk; no dependencies)
     lib/server.sh      one server's lifecycle: preflight, start, stop, state, env id
+    hooks/             session-log.py: the Stop/SessionStart pair that keeps two
+                       accounts' sessions aware of each other in a shared worktree
     install.sh         symlink onto PATH, optionally install the supervisor
 
 Config is `~/.crc/servers.ini`; logs follow platform convention (`~/Library/Logs/...` on

@@ -50,6 +50,8 @@ Works on macOS (launchd) and Linux (systemd user timer). Requirements: `bash`, `
     crc restart-session cse_01ABC…  # restart one live chat; its server and other chats keep running
     crc login                       # sign this machine in: prints a URL, takes the code
     crc login status --json         # what a remote client polls
+    crc account list                # identities on this machine (second subscription)
+    crc fork cse_01ABC… --account second   # continue a chat under the other account
     crc doctor                      # tools, registry, per-server readiness
 
 A failed start is reported as such: `crc start` / `crc restart` wait for the server process
@@ -82,6 +84,52 @@ the empty-record case, so a broken token shows up before every server does.
 
 New credentials are only read at process start, which is why logging in restarts the
 servers — and interrupts every live chat. That is unavoidable, not an oversight.
+
+## Two subscriptions, one machine
+
+A chat belongs to the account that created it. Two accounts cannot share a session, and
+the app lists only environments owned by the account you are signed into. What they *can*
+share is the machine and the worktree on it — `CLAUDE_CONFIG_DIR` gives each account a
+complete, separate Claude identity (credentials, transcripts, settings, trust).
+
+    crc account add second            # ~/.claude-second, settings copied from the primary
+    crc login --account second        # sign it in; the servers are left alone
+    crc account list                  # who each identity is signed in as
+
+When one subscription hits its limit, hand the chat to the other:
+
+    crc fork cse_01ABC… --account second
+
+The conversation cannot move, but its transcript is a file and the local session id is
+derived from the cloud one, so the second identity can resume it. You get a *new* session,
+owned by the second account, carrying the history, in the same worktree on the same branch.
+It appears in that account's app; the original is untouched. `--fork-session` keeps the two
+transcripts separate, so the first account's chat still has its own.
+
+### The shared log
+
+Once two sessions work one worktree they diverge immediately, so `crc fork` installs two
+hooks there (`hooks/session-log.py`, also installable by hand):
+
+- **Stop** — appends what the turn did: branch, HEAD, commits added, files touched, and the
+  closing message. Facts first, because prose drifts and git does not.
+- **SessionStart** — injects what the *other* accounts did while this session was away.
+
+It is built for the ways this goes wrong:
+
+- **A watermark per reader**, so resuming ten times does not re-inject the same history ten
+  times.
+- **Echo suppression.** A turn written right after a sync is flagged, and never fed back to
+  the account it came from — otherwise A reads B, paraphrases B, logs it, and B reads its
+  own words back as news.
+- **Compaction is recorded, not hidden.** Resume, fork and compact each write a marker with
+  the tokens re-sent, so both sides can see where the other's picture of the work was
+  rebuilt — and the injected text says to trust the tree over any summary.
+
+    crc handoff cse_01ABC… --from-account second   # log an entry by hand, for chats
+                                                   # that started before the hooks existed
+
+The log lives in `~/.crc/session-logs/`, never in the repo.
 
 ## The registry
 

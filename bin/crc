@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 crc_migrate_legacy
 
@@ -38,8 +38,12 @@ usage: crc <command> [args]
   stop <name...|--all>          stop servers
   remove <name> [--purge]       stop, unregister, optionally delete the directory
   trust <name>                  accept the one-time workspace/MCP dialogs
-  login [start|code <c>|status|cancel]
+  login [start|code <c>|status|cancel] [--account <name>]
                                 sign this machine in to Claude, then restart servers
+  account <add|list|remove>     a second subscription, as its own Claude identity
+  fork <session-id> --account <name>
+                                continue a chat under another account, same worktree
+  handoff <session-id>          append what a chat just did to the shared log
   sessions <name>               list revivable chat sessions, newest first
   revive <session-id> [server] [--branch <name>]
                                 reattach an old chat, restoring its worktree if gone
@@ -515,7 +519,7 @@ CRC_LOGIN_SESSION="crc-login"
 # Credential health, printed as: state expires_epoch refresh subscription
 # States: ok | expiring | expired | empty (record with no tokens) | missing | unknown
 auth_status() {
-  local f="$HOME/.claude/.credentials.json"
+  local f="${CRC_LOGIN_CONFIG:-$HOME/.claude}/.credentials.json"
   [ -f "$f" ] || { echo "missing 0 no -"; return 1; }
   command -v python3 >/dev/null 2>&1 || { echo "unknown 0 ? -"; return 0; }
   python3 - "$f" <<'PY'
@@ -585,10 +589,11 @@ login_wait_for() {
 login_url() { tui_pane "$1" 2>/dev/null | grep -oE 'https://claude\.(com|ai)/[^ ]*oauth[^ ]*' | tail -1; }
 
 login_start() {
-  local tmux claude dir s="$CRC_LOGIN_SESSION" url
+  local tmux claude dir s="$CRC_LOGIN_SESSION" url prefix="" i screen
   tmux="$(crc_tmux)" || die "tmux not found"
   claude="$(crc_claude)" || die "claude not found"
   dir="$(login_dir)" || die "no trusted workspace to log in from — run 'crc trust <name>' first"
+  [ -n "${CRC_LOGIN_CONFIG:-}" ] && prefix="CLAUDE_CONFIG_DIR=$(printf '%q' "$CRC_LOGIN_CONFIG") "
 
   # An already-running flow still has a usable URL: hand back the same one rather
   # than starting a second sign-in the user did not ask for.
@@ -603,18 +608,32 @@ login_start() {
   # URL runs past 450 characters, so this has to be wider than it looks reasonable.
   "$tmux" new-session -d -s "$s" -x 1000 -y 50 -c "$dir"
   sleep 1
-  "$tmux" send-keys -t "${s}:0.0" "cd $(printf '%q' "$dir") && $(printf '%q' "$claude")" C-m
-  login_wait_for "$s" 'auto mode|bypass permissions|shift\+tab' 120 \
-    || warn "claude is slow to start; continuing"
-  "$tmux" send-keys -t "${s}:0.0" "/login" C-m
-  login_wait_for "$s" 'Select login method' 60 \
-    || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "the login screen did not appear"; }
-  # Match the option line itself: the blurb above it also says "subscription",
-  # and aiming the cursor at that line walks it the wrong way until it gives up.
-  tui_choose "$s" "Claude account with subscription" \
-    || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "could not select the subscription login option"; }
-  login_wait_for "$s" 'oauth/authorize' 60 \
-    || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "no login URL appeared"; }
+  "$tmux" send-keys -t "${s}:0.0" "cd $(printf '%q' "$dir") && ${prefix}$(printf '%q' "$claude")" C-m
+
+  # A fresh config dir has never been through onboarding, so the login prompt is not
+  # the first screen: theme, security notes and the folder-trust question come first,
+  # in no guaranteed order. Answer whatever is on screen until the URL shows up.
+  for i in $(seq 1 40); do
+    screen="$(tui_pane "$s" 2>/dev/null)"
+    case "$screen" in
+      *oauth/authorize*) break ;;
+      *"Select login method"*)
+        # Match the option line itself: the blurb above it also says "subscription",
+        # and aiming the cursor at that line walks it the wrong way until it gives up.
+        tui_choose "$s" "Claude account with subscription" \
+          || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "could not select the subscription login option"; } ;;
+      *"trust this folder"*)
+        tui_choose "$s" "Yes, I trust this folder" \
+          || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "could not accept the folder-trust dialog"; } ;;
+      *"Press Enter to continue"*|*"text style"*|*"Light mode"*|*"Dark mode"*)
+        "$tmux" send-keys -t "${s}:0.0" Enter ;;
+      *"auto mode"*|*"shift+tab"*)
+        "$tmux" send-keys -t "${s}:0.0" "/login" C-m ;;
+    esac
+    sleep 3
+  done
+  login_wait_for "$s" 'oauth/authorize' 30 \
+    || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "no login URL appeared — attach with 'tmux attach -t $s'"; }
   url="$(login_url "$s")"
   [ -n "$url" ] || { "$tmux" kill-session -t "=$s" 2>/dev/null; die "could not read the login URL from the screen"; }
   crc_log "login flow started"
@@ -652,15 +671,23 @@ login_cancel() {
 }
 
 cmd_login() {
-  local sub="" code="" json=0 restart=1
+  local sub="" code="" json=0 restart=1 account=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --json)       json=1; shift ;;
       --no-restart) restart=0; shift ;;
+      --account)    account="${2:-}"; shift 2 ;;
       -*) die "unknown option: $1" ;;
       *) if [ -z "$sub" ]; then sub="$1"; else code="$1"; fi; shift ;;
     esac
   done
+  if [ -n "$account" ] && [ "$account" != default ]; then
+    CRC_LOGIN_CONFIG="$(acct_dir "$account")" || die "unknown account: $account (crc account add $account)"
+    export CRC_LOGIN_CONFIG
+    # The servers run under the default identity; restarting them on behalf of a
+    # second account would interrupt every live chat for nothing.
+    restart=0
+  fi
 
   case "$sub" in
   status)
@@ -721,6 +748,268 @@ login_restart() {
   say ""
   say "restarting all servers so they pick up the new credentials (${live:-0} chat session(s) will be interrupted)"
   cmd_restart --all
+}
+
+# ---------------------------------------------------------------------------
+# Accounts.
+#
+# A chat belongs to the account that created it: two subscriptions cannot share
+# one session, and the app only lists environments owned by the account you are
+# signed into. What they *can* share is this machine and the worktree on it.
+#
+# CLAUDE_CONFIG_DIR gives each account a complete, separate Claude identity —
+# credentials, transcripts, settings, trust. Accounts live in [accounts] in the
+# registry as name = config dir.
+
+acct_dir() {
+  local name="${1:-}" d
+  [ -n "$name" ] && [ "$name" != default ] || { echo "$HOME/.claude"; return 0; }
+  d="$(reg_get_raw accounts "$name")"
+  [ -n "$d" ] || return 1
+  case "$d" in "~"/*) d="$HOME/${d#\~/}" ;; esac
+  echo "$d"
+}
+
+# Who a config dir is signed in as, for display.
+acct_email() {
+  local cfg="$1" conf
+  # The default identity keeps its config beside the directory, not inside it.
+  if [ "$cfg" = "$HOME/.claude" ]; then conf="$HOME/.claude.json"; else conf="$cfg/.claude.json"; fi
+  [ -f "$conf" ] || { echo "-"; return 0; }
+  command -v python3 >/dev/null 2>&1 || { echo "?"; return 0; }
+  python3 - "$conf" <<'PY'
+import json, sys
+try:
+    a = (json.load(open(sys.argv[1])) or {}).get("oauthAccount") or {}
+    print(a.get("emailAddress") or "-")
+except Exception:
+    print("?")
+PY
+}
+
+cmd_account() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+  add)
+    local name="${1:-}"; shift || true
+    [ -n "$name" ] || die "usage: crc account add <name> [--config-dir <path>]"
+    case "$name" in default) die "'default' is the primary ~/.claude identity and is always available" ;; esac
+    local dir="$HOME/.claude-$name"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --config-dir) dir="${2:-}"; shift 2 ;;
+        *) die "unknown option: $1" ;;
+      esac
+    done
+    [ -n "$(reg_get_raw accounts "$name")" ] && die "account $name already exists"
+    mkdir -p "$dir"
+    # Carry the settings that make sessions behave the same under both accounts —
+    # the auto-mode rules especially, which the classifier reads only from here.
+    [ -f "$dir/settings.json" ] || [ ! -f "$HOME/.claude/settings.json" ] \
+      || cp "$HOME/.claude/settings.json" "$dir/settings.json"
+    reg_set accounts "$name" "$dir"
+    say "registered account $name -> $dir"
+    say "sign it in with:  crc login --account $name" ;;
+  list)
+    local f line name dir
+    f="$(reg_file)"
+    [ -f "$f" ] || { say "no accounts registered"; return 0; }
+    printf '%-12s %-34s %s\n' NAME 'CONFIG DIR' 'SIGNED IN AS'
+    printf '%-12s %-34s %s\n' default "$HOME/.claude" "$(acct_email "$HOME/.claude")"
+    awk '/^[[:space:]]*\[/ { s=$0; sub(/^[[:space:]]*\[/,"",s); sub(/\][[:space:]]*$/,"",s); sec=s; next }
+         sec == "accounts" && /=/ { print }' "$f" | while IFS= read -r line; do
+      name="${line%%=*}"; name="$(printf '%s' "$name" | tr -d '[:space:]')"
+      [ -n "$name" ] || continue
+      dir="$(acct_dir "$name")" || continue
+      printf '%-12s %-34s %s\n' "$name" "$dir" "$(acct_email "$dir")"
+    done ;;
+  remove)
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: crc account remove <name>"
+    [ -n "$(reg_get_raw accounts "$name")" ] || die "unknown account: $name"
+    local dir; dir="$(acct_dir "$name")"
+    reg_set accounts "$name" ""        # key kept empty; the dir is left on disk
+    say "unregistered $name (its config dir $dir was kept — delete it by hand if you mean it)" ;;
+  *) die "usage: crc account <add|list|remove>" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Forking a chat to another account.
+#
+# The chat cannot move — but its transcript is a file, and the local session id is
+# derived from the cloud one, so another identity can resume it. The result is a new
+# session, owned by the second account, carrying the history and sitting in the same
+# worktree on the same branch. Use it when one subscription is rate-limited and the
+# work should not stop.
+
+fork_hooks_install() {
+  local dir="$1" hook="$CRC_ROOT/hooks/session-log.py" out
+  [ -f "$hook" ] || { warn "hook script missing at $hook — skipping the shared log"; return 1; }
+  command -v python3 >/dev/null 2>&1 || { warn "python3 not found — skipping the shared log"; return 1; }
+  chmod +x "$hook" 2>/dev/null || true
+  out="$(python3 - "$dir/.claude/settings.local.json" "$hook" <<'PY'
+import json, os, sys
+path, hook = sys.argv[1], sys.argv[2]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+try:
+    cfg = json.load(open(path)) or {}
+except Exception:
+    cfg = {}
+hooks = cfg.setdefault("hooks", {})
+changed = []
+def install(event, matcher, mode):
+    cmd = "%s %s" % (hook, mode)
+    entries = hooks.setdefault(event, [])
+    for group in entries:
+        for h in group.get("hooks", []):
+            if h.get("command") == cmd:
+                return
+    entries.append({"matcher": matcher, "hooks": [{"type": "command", "command": cmd, "timeout": 15}]})
+    changed.append(event)
+install("Stop", "*", "stop")
+install("SessionStart", "startup|resume|fork", "start")
+if changed:
+    json.dump(cfg, open(path, "w"), indent=2)
+    open(path, "a").write("\n")
+print(",".join(changed) if changed else "already installed")
+PY
+)" || { warn "could not install the shared-log hooks"; return 1; }
+  say "shared log hooks: $out"
+}
+
+cmd_fork() {
+  local sid="" account="" rcname="" from="" hooks=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account)      account="${2:-}"; shift 2 ;;
+      --from-account) from="${2:-}"; shift 2 ;;
+      --name)         rcname="${2:-}"; shift 2 ;;
+      --no-hooks)     hooks=0; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) sid="$1"; shift ;;
+    esac
+  done
+  [ -n "$sid" ] || die "usage: crc fork <session-id> --account <name> [--name <rc name>]"
+  [ -n "$account" ] || die "which account should continue it? pass --account <name> (crc account list)"
+  case "$sid" in bridge-cse_*) sid="cse_${sid#bridge-cse_}" ;; esac
+
+  local target src; target="$(acct_dir "$account")" || die "unknown account: $account (crc account add $account)"
+  src="$(acct_dir "$from")" || die "unknown account: $from"
+  [ -d "$target" ] || die "$account has no config dir at $target"
+  [ "$target" = "$src" ] && die "source and target are the same identity — the point is to hand the work to a different account"
+
+  # Find the worktree, the same way revive does.
+  local repo="" name="" n d
+  for n in $(reg_names); do
+    d="$(srv_dir "$n" 2>/dev/null || echo '')"
+    [ -n "$d" ] && [ -d "$d/.claude/worktrees/bridge-$sid" ] && { repo="$d"; name="$n"; break; }
+  done
+  [ -n "$repo" ] || die "no registered workspace has a worktree for $sid"
+  local wt="$repo/.claude/worktrees/bridge-$sid"
+  local mangled; mangled="$(printf '%s' "$wt" | sed 's|[/._]|-|g')"
+  local sproj="$src/projects/$mangled" tproj="$target/projects/$mangled"
+
+  local jsonl uuid
+  jsonl="$(ls -t "$sproj"/*.jsonl 2>/dev/null | head -1)" \
+    || die "no transcript for $sid under $(basename "$src")"
+  [ -n "$jsonl" ] || die "no transcript for $sid at $sproj"
+  uuid="$(basename "$jsonl" .jsonl)"
+  local branch; branch="$("$(crc_git)" -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  [ -n "$rcname" ] || rcname="$name-$account"
+
+  if [ "${CRC_DRY_RUN:-0}" = 1 ]; then
+    say "[dry-run] would copy $jsonl"
+    say "[dry-run]   -> $tproj/$uuid.jsonl  ($(wc -c < "$jsonl" | tr -d ' ') bytes)"
+    say "[dry-run] then resume it as $account in $wt (branch $branch) as '$rcname'"
+    return 0
+  fi
+
+  mkdir -p "$tproj"
+  if [ -f "$tproj/$uuid.jsonl" ]; then say "transcript already present under $account"
+  else cp "$jsonl" "$tproj/$uuid.jsonl"; say "copied transcript ($(wc -c < "$jsonl" | tr -d ' ') bytes) to $account"; fi
+
+  [ "$hooks" = 1 ] && fork_hooks_install "$wt"
+
+  local tmux claude session; tmux="$(crc_tmux)"; claude="$(crc_claude)"
+  session="fork-$(printf '%s' "$sid" | cut -c5-12)"
+  "$tmux" has-session -t "=$session" 2>/dev/null && { say "$session is already running"; return 0; }
+  "$tmux" new-session -d -s "$session" -x 220 -y 50 -c "$wt"
+  sleep 1
+  # --fork-session: take a new session id so the original file keeps belonging to the
+  # account that owns the original chat.
+  "$tmux" send-keys -t "${session}:0.0" \
+    "cd $(printf '%q' "$wt") && CLAUDE_CONFIG_DIR=$(printf '%q' "$target") $(printf '%q' "$claude") --resume $uuid --fork-session --remote-control $(printf '%q' "$rcname")" C-m
+
+  say "resuming $uuid as $account in $wt (branch $branch) — replaying the transcript takes a minute"
+  local i url=""
+  for i in $(seq 1 90); do
+    url="$("$tmux" capture-pane -pJ -t "${session}:0.0" 2>/dev/null | grep -oE 'https://claude\.ai/code/session_[A-Za-z0-9]+' | tail -1)"
+    [ -n "$url" ] && break
+    sleep 2
+  done
+  crc_log "forked $sid to account $account in $wt"
+  if [ -n "$url" ]; then
+    say "live under $account: $url"
+  else
+    warn "no session link appeared yet — watch it with 'tmux attach -t $session'"
+    return 1
+  fi
+}
+
+# Append to the shared log by hand, for a chat that started before the hooks existed.
+cmd_handoff() {
+  local sid="" from="" text=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from-account) from="${2:-}"; shift 2 ;;
+      --text)         text="${2:-}"; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) sid="$1"; shift ;;
+    esac
+  done
+  [ -n "$sid" ] || die "usage: crc handoff <session-id> [--from-account <name>] [--text <summary>]"
+  case "$sid" in bridge-cse_*) sid="cse_${sid#bridge-cse_}" ;; esac
+  local cfg; cfg="$(acct_dir "$from")" || die "unknown account: $from"
+  local repo="" n d
+  for n in $(reg_names); do
+    d="$(srv_dir "$n" 2>/dev/null || echo '')"
+    [ -n "$d" ] && [ -d "$d/.claude/worktrees/bridge-$sid" ] && { repo="$d"; break; }
+  done
+  [ -n "$repo" ] || die "no registered workspace has a worktree for $sid"
+  local wt="$repo/.claude/worktrees/bridge-$sid"
+  local mangled; mangled="$(printf '%s' "$wt" | sed 's|[/._]|-|g')"
+  local jsonl; jsonl="$(ls -t "$cfg/projects/$mangled"/*.jsonl 2>/dev/null | head -1)"
+  [ -n "$jsonl" ] || die "no transcript for $sid under $(basename "$cfg")"
+
+  if [ -z "$text" ]; then
+    text="$(python3 - "$jsonl" <<'PY'
+import json, sys
+last = ""
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        row = json.loads(line)
+    except Exception:
+        continue
+    if row.get("type") != "assistant":
+        continue
+    content = (row.get("message") or {}).get("content")
+    if isinstance(content, list):
+        text = " ".join(b.get("text", "") for b in content if b.get("type") == "text").strip()
+        if text:
+            last = text
+print(last[:1200])
+PY
+)"
+  fi
+  [ -n "$text" ] || die "nothing to log: no assistant message found and no --text given"
+  CLAUDE_CONFIG_DIR="$cfg" python3 "$CRC_ROOT/hooks/session-log.py" stop <<EOF
+{"session_id":"$sid","cwd":"$wt","hook_event_name":"Stop","last_assistant_message":$(printf '%s' "$text" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}
+EOF
+  say "logged a handoff entry for $sid"
 }
 
 # A running server with no environment means session creation is being refused.
@@ -878,6 +1167,9 @@ main() {
     remove|rm)    cmd_remove "$@" ;;
     trust)        cmd_trust "$@" ;;
     login)        cmd_login "$@" ;;
+    account)      cmd_account "$@" ;;
+    fork)         cmd_fork "$@" ;;
+    handoff)      cmd_handoff "$@" ;;
     revive)       cmd_revive "$@" ;;
     sessions)     cmd_sessions "$@" ;;
     tick)         cmd_tick "$@" ;;
