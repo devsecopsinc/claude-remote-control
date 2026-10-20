@@ -29,13 +29,14 @@ EOF
 }
 
 # List server section names in file order. [defaults] supplies fallback values and
-# [accounts] maps account names to config dirs; neither is a server.
+# [accounts] maps account names to config dirs, and [fork:<name>] sections describe
+# forked chats the supervisor keeps alive; none of them is a server.
 reg_names() {
   local f; f="$(reg_file)"
   [ -f "$f" ] || return 0
   awk '/^[[:space:]]*\[/ {
          s=$0; sub(/^[[:space:]]*\[/,"",s); sub(/\][[:space:]]*$/,"",s)
-         if (s != "defaults" && s != "accounts") print s
+         if (s != "defaults" && s != "accounts" && s !~ /^fork:/) print s
        }' "$f"
 }
 
