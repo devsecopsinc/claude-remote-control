@@ -14,6 +14,13 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 srv_pids() { pgrep -f "remote-control --name $1 " 2>/dev/null || true; }
 srv_running() { [ -n "$(srv_pids "$1")" ]; }
 
+# Which identity runs this server. Servers default to the primary ~/.claude; a server
+# bound to a second subscription runs with CLAUDE_CONFIG_DIR pointed at that identity.
+# Claude Code refuses two remote-control servers on one folder *per identity*, so two
+# accounts can serve the same repo but one account cannot serve it twice.
+srv_account()    { reg_get "$1" account default; }
+srv_config_dir() { acct_dir "$(srv_account "$1")"; }
+
 srv_session() { local p; p="$(reg_get "$1" session_prefix '')"; echo "${p}$1"; }
 
 srv_dir() {
@@ -32,11 +39,15 @@ srv_preflight() {
     "$(crc_git)" -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
       || problems="$problems not-a-git-repo(worktree-spawn-requires-one)"
   fi
-  # Trust is recorded per directory in ~/.claude.json; without it the server exits at once.
-  if [ -f "$HOME/.claude.json" ] && command -v python3 >/dev/null 2>&1; then
-    python3 - "$dir" <<'PY' || problems="$problems workspace-not-trusted(run:'cd DIR && claude')"
+  # Trust is recorded per directory in the identity's config file; without it the
+  # server exits at once. The primary keeps that file beside ~/.claude, not inside it.
+  local cfgdir conf
+  cfgdir="$(srv_config_dir "$name" 2>/dev/null || echo "$HOME/.claude")"
+  if [ "$cfgdir" = "$HOME/.claude" ]; then conf="$HOME/.claude.json"; else conf="$cfgdir/.claude.json"; fi
+  if [ -f "$conf" ] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$dir" "$conf" <<'PY' || problems="$problems workspace-not-trusted(run:'crc trust NAME')"
 import json, os, sys
-p = os.path.expanduser("~/.claude.json")
+p = sys.argv[2]
 try:
     d = json.load(open(p))
 except Exception:
@@ -74,7 +85,10 @@ srv_start() {
     crc_log "$name recycled dead tmux session"
   fi
 
-  cmd="cd $(printf '%q' "$dir") && $(printf '%q' "$claude") remote-control --name $name"
+  local cfgdir prefix=""
+  cfgdir="$(srv_config_dir "$name" 2>/dev/null || echo "$HOME/.claude")"
+  [ "$cfgdir" = "$HOME/.claude" ] || prefix="CLAUDE_CONFIG_DIR=$(printf '%q' "$cfgdir") "
+  cmd="cd $(printf '%q' "$dir") && ${prefix}$(printf '%q' "$claude") remote-control --name $name"
   cmd="$cmd --spawn $spawn --permission-mode $mode"
   cmd="$cmd --debug-file $(printf '%q' "$logdir/rc-$name.log")"
   [ -n "$extra" ] && cmd="$cmd $extra"
@@ -89,6 +103,7 @@ srv_start() {
     "$tmux" new-session -d -s "$session" -c "$dir"
     sleep 1
     "$tmux" send-keys -t "${session}:0.0" "$cmd" C-m
+    srv_answer_first_run "$name" "$session"
     if srv_wait_settled "$name" 15; then
       crc_log "$name started in $dir (attempt $attempt)"
       say "$name: started"
@@ -99,6 +114,32 @@ srv_start() {
   warn "$name: failed to start — see $logdir/rc-$name.log and 'tmux attach -t $session'"
   crc_log "$name failed to start"
   return 1
+}
+
+# Remote Control asks for consent once per identity, and refuses a folder another
+# server of the same identity already serves. Both look like "running but useless":
+# the process is alive, sitting on a question or an error, serving nothing.
+srv_answer_first_run() {
+  local name="$1" session="$2" tmux screen i
+  tmux="$(crc_tmux)"
+  for i in 1 2 3 4 5 6 7 8; do
+    screen="$("$tmux" capture-pane -pJ -t "${session}:0.0" 2>/dev/null)"
+    case "$screen" in
+      *"Enable Remote Control?"*)
+        "$tmux" send-keys -t "${session}:0.0" "y" C-m
+        crc_log "$name answered the Remote Control consent prompt"
+        sleep 2 ;;
+      *"already served by a terminal"*)
+        warn "$name: this folder is already served by another '$(srv_account "$name")' server on this machine."
+        warn "  Two accounts can serve one repo; one account cannot serve it twice."
+        warn "  Check 'crc list' for another server on $(srv_dir "$name") with the same ACCOUNT."
+        crc_log "$name refused: folder already served for account $(srv_account "$name")"
+        return 1 ;;
+      *Ready*|*Connected*) return 0 ;;
+    esac
+    sleep 2
+  done
+  return 0
 }
 
 # Wait for a server process to appear, up to N seconds. Returns as soon as it does,
@@ -144,10 +185,11 @@ srv_stop() {
 
 # Environment id, from the pointer Claude Code keeps per project directory.
 srv_env_id() {
-  local dir mangled f
+  local dir mangled f cfgdir
   dir="$(srv_dir "$1")" || return 1
+  cfgdir="$(srv_config_dir "$1" 2>/dev/null || echo "$HOME/.claude")"
   mangled="$(printf '%s' "$dir" | sed 's|/|-|g')"
-  f="$HOME/.claude/projects/${mangled}/bridge-pointer.json"
+  f="$cfgdir/projects/${mangled}/bridge-pointer.json"
   [ -f "$f" ] || return 1
   sed -n 's/.*"environmentId":"\([^"]*\)".*/\1/p' "$f"
 }
