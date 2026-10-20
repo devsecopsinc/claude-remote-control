@@ -95,6 +95,13 @@ complete, separate Claude identity (credentials, transcripts, settings, trust).
     crc account add second            # ~/.claude-second, settings copied from the primary
     crc login --account second        # sign it in; the servers are left alone
     crc account list                  # who each identity is signed in as
+    crc add work2 --dir ~/github/work --account second   # a server that runs as that identity
+
+A server records its identity in the registry (`account = second`) and `crc list` shows it,
+alongside that identity's own environment id. Two accounts can serve the same repo; one
+account cannot serve it twice — Claude Code refuses the second with *"This folder is already
+served by a terminal claude remote-control on this device"*, and `crc doctor` reports that
+pair as a conflict rather than leaving a watchdog to retry it forever.
 
 When one subscription hits its limit, hand the chat to the other:
 

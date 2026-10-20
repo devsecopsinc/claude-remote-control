@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 
 crc_migrate_legacy
 
@@ -62,6 +62,7 @@ add options:
   --spawn <worktree|same-dir|session>
   --permission-mode <mode>      default: bypassPermissions
   --mcp-from <name>             copy .mcp.json from another registered workspace
+  --account <name>              run this server as a second identity (crc account list)
   --no-start                    register only
 
 global:
@@ -86,13 +87,13 @@ cmd_list() {
   reg_init
   local names; names="$(reg_names)"
   [ -z "$names" ] && { say "no servers registered — add one with 'crc add <name> --repo <url>'"; return 0; }
-  printf '%-14s %-9s %-8s %-30s %s\n' NAME STATE PIDS ENVIRONMENT DIR
+  printf '%-14s %-9s %-8s %-10s %-30s %s\n' NAME STATE PIDS ACCOUNT ENVIRONMENT DIR
   local n pids env state
   for n in $names; do
     state="$(srv_state "$n")"
     pids="$(srv_pids "$n" | tr '\n' ',' | sed 's/,$//')"
     env="$(srv_env_id "$n" 2>/dev/null || echo -)"
-    printf '%-14s %-9s %-8s %-30s %s\n' "$n" "$state" "${pids:--}" "${env:--}" "$(srv_dir "$n" 2>/dev/null || echo -)"
+    printf '%-14s %-9s %-8s %-10s %-30s %s\n' "$n" "$state" "${pids:--}" "$(srv_account "$n")" "${env:--}" "$(srv_dir "$n" 2>/dev/null || echo -)"
   done
 }
 
@@ -141,7 +142,7 @@ cmd_add() {
   reg_has "$name" && die "$name is already registered (crc remove $name first)"
 
   local repo="" create="" dir="" vis="--private" spawn="worktree" mode="bypassPermissions"
-  local mcp_from="" start=1
+  local mcp_from="" start=1 account=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo)            repo="${2:-}"; shift 2 ;;
@@ -152,6 +153,7 @@ cmd_add() {
       --spawn)           spawn="${2:-}"; shift 2 ;;
       --permission-mode) mode="${2:-}"; shift 2 ;;
       --mcp-from)        mcp_from="${2:-}"; shift 2 ;;
+      --account)         account="${2:-}"; shift 2 ;;
       --no-start)        start=0; shift ;;
       *) die "unknown option: $1" ;;
     esac
@@ -199,6 +201,10 @@ cmd_add() {
 
   reg_set "$name" dir "$dir"
   [ -n "$repo" ] && reg_set "$name" repo "$repo"
+  if [ -n "$account" ] && [ "$account" != default ]; then
+    acct_dir "$account" >/dev/null || die "unknown account: $account (crc account add $account)"
+    reg_set "$name" account "$account"
+  fi
   reg_set "$name" spawn "$spawn"
   reg_set "$name" permission_mode "$mode"
   reg_set "$name" enabled true
@@ -240,14 +246,16 @@ tui_choose() {
 cmd_trust() {
   local name="${1:-}"; [ -n "$name" ] || die "usage: crc trust <name>"
   reg_has "$name" || die "unknown server: $name"
-  local dir tmux claude s; dir="$(srv_dir "$name")"
+  local dir tmux claude s cfgdir prefix=""; dir="$(srv_dir "$name")"
   tmux="$(crc_tmux)"; claude="$(crc_claude)"; s="crc-trust-$$"
+  cfgdir="$(srv_config_dir "$name" 2>/dev/null || echo "$HOME/.claude")"
+  [ "$cfgdir" = "$HOME/.claude" ] || prefix="CLAUDE_CONFIG_DIR=$(printf '%q' "$cfgdir") "
   if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would accept dialogs in $dir"; return 0; fi
 
   say "opening $dir to accept the one-time dialogs…"
   "$tmux" new-session -d -s "$s" -c "$dir"
   sleep 1
-  "$tmux" send-keys -t "${s}:0.0" "cd $(printf '%q' "$dir") && $(printf '%q' "$claude")" C-m
+  "$tmux" send-keys -t "${s}:0.0" "cd $(printf '%q' "$dir") && ${prefix}$(printf '%q' "$claude")" C-m
   sleep 10
 
   if tui_pane "$s" | grep -q "trust this folder"; then
@@ -1045,6 +1053,21 @@ cmd_doctor() {
   # Credentials: a headless box cannot read a locked login keychain, and a failed
   # refresh empties the record, taking every chat on the machine down with it.
   auth_report || ok=1
+
+  # Two servers of the SAME identity on one directory: the second never serves, and
+  # a watchdog will retry it forever. This is what orphaned an environment once.
+  local a b
+  for a in $(reg_names); do
+    for b in $(reg_names); do
+      [ "$a" = "$b" ] && continue
+      [ "$(srv_dir "$a" 2>/dev/null)" = "$(srv_dir "$b" 2>/dev/null)" ] || continue
+      [ "$(srv_account "$a")" = "$(srv_account "$b")" ] || continue
+      warn "conflict:  $a and $b share $(srv_dir "$a") as the same account ($(srv_account "$a"))"
+      warn "           only one of them can ever serve it — give one a different --account"
+      ok=1
+      break 2
+    done
+  done
 
   say ""
   local n why
