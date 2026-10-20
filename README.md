@@ -113,6 +113,22 @@ owned by the second account, carrying the history, in the same worktree on the s
 It appears in that account's app; the original is untouched. `--fork-session` keeps the two
 transcripts separate, so the first account's chat still has its own.
 
+### Keeping forks alive
+
+A fork is a plain process: no server owns it, so a reboot takes it with no trace. `crc fork`
+records it, and `crc tick` — the supervisor — brings it back:
+
+    crc forks                     # name, state, account, worktree
+    crc forks start [name]        # start what is missing
+    crc forks stop <name>
+    crc forks adopt <name> --dir <worktree> --account <acct>   # take over one started by hand
+    crc forks forget <name>
+    crc fork … --no-supervise     # one-off, not recorded
+
+What is recorded is the worktree and the identity, not a transcript id: every restart writes
+a new transcript, so the newest one for that worktree under that account is what gets resumed
+— a restarted fork continues from where it actually is, not from where it was forked.
+
 ### The shared log
 
 Once two sessions work one worktree they diverge immediately, so `crc fork` installs two
