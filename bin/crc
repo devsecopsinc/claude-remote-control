@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.7.0"
+VERSION="1.7.1"
 
 crc_migrate_legacy
 
@@ -1133,7 +1133,24 @@ cmd_forks() {
     else for n in $(fork_names); do fork_start "$n"; done; fi ;;
   stop)
     local n="${1:-}"; [ -n "$n" ] || die "usage: crc forks stop <name>"
-    pkill -f -- "--remote-control $n " && say "$n: stopped" || say "$n: not running"
+    # Same end-of-string anchor as fork_running: the name is the last argument, so a
+    # trailing space never matches and the fork is silently left running.
+    local pids; pids="$(pgrep -f -- "--remote-control $n(\$| )" 2>/dev/null)"
+    if [ -n "$pids" ]; then
+      # shellcheck disable=SC2086
+      kill $pids 2>/dev/null
+      local i
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -f -- "--remote-control $n(\$| )" >/dev/null 2>&1 || break
+        sleep 1
+      done
+      pgrep -f -- "--remote-control $n(\$| )" >/dev/null 2>&1 && {
+        # shellcheck disable=SC2086
+        kill -KILL $pids 2>/dev/null; warn "$n did not exit on SIGTERM; killed"; }
+      say "$n: stopped"
+    else
+      say "$n: not running"
+    fi
     "$(crc_tmux)" kill-session -t "=fork-$n" 2>/dev/null || true ;;
   adopt)
     # Take over a fork that was started by hand: record it without touching the

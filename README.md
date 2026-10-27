@@ -154,6 +154,15 @@ It is built for the ways this goes wrong:
 
 The log lives in `~/.crc/session-logs/`, never in the repo.
 
+## When the host fills up
+
+Worktrees, MCP children and logs accumulate until the disk or swap runs out — and the
+symptoms look like Claude breaking, not like a full machine: sessions that never finish
+connecting, chats stuck in uninterruptible I/O, `Worktree creation failed … Could not read
+the repository git config`. **docs/cleanup.md** is the recipe: how to tell, which worktrees
+are safe to delete (and the four gates that make that safe), how to find duplicated MCP
+servers, and how to upgrade with one server restarted at a time.
+
 ## The registry
 
 Config lives in `~/.crc`; logs go where the platform keeps logs. Override either with
