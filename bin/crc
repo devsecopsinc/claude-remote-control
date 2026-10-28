@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.7.2"
+VERSION="1.8.0"
 
 crc_migrate_legacy
 
@@ -38,6 +38,8 @@ usage: crc <command> [args]
   stop <name...|--all>          stop servers
   remove <name> [--purge]       stop, unregister, optionally delete the directory
   trust <name>                  accept the one-time workspace/MCP dialogs
+  mcp <name> [--from <other> | --add <key> --url <u>] [--as <key>]
+                                show or set a workspace's MCP servers, then restart it
   login [start|code <c>|status|cancel] [--account <name>]
                                 sign this machine in to Claude, then restart servers
   account <add|list|remove>     a second subscription, as its own Claude identity
@@ -1182,6 +1184,132 @@ cmd_forks() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# A workspace's MCP servers.
+#
+# Sessions read .mcp.json at startup, from the workspace directory. Adding a server
+# to a live chat does nothing: a remote-control session loads MCP servers only from
+# the verified startup config, so the server has to be restarted for anything to
+# appear. That pairing — edit the file, restart the server — is the whole command.
+
+mcp_file() { echo "$(srv_dir "$1")/.mcp.json"; }
+
+mcp_show() {
+  local name="$1" f; f="$(mcp_file "$name")"
+  [ -f "$f" ] || { say "$name declares no MCP servers ($f does not exist)"; return 0; }
+  command -v python3 >/dev/null 2>&1 || { cat "$f"; return 0; }
+  python3 - "$f" <<'PY'
+import json, sys
+try:
+    servers = (json.load(open(sys.argv[1])) or {}).get("mcpServers") or {}
+except Exception as exc:
+    print("  unreadable: %s" % exc); sys.exit(0)
+if not servers:
+    print("  none declared")
+for key, cfg in servers.items():
+    where = cfg.get("url") or cfg.get("command") or "?"
+    print("  %-28s %-6s %s" % (key, cfg.get("type", "?"), where))
+PY
+}
+
+cmd_mcp() {
+  local name="" from="" add="" url="" as="" restart=1 type=http
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)       from="${2:-}"; shift 2 ;;
+      --add)        add="${2:-}"; shift 2 ;;
+      --url)        url="${2:-}"; shift 2 ;;
+      --as)         as="${2:-}"; shift 2 ;;
+      --no-restart) restart=0; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: crc mcp <server> [--from <other> | --add <key> --url <url>] [--as <key>] [--no-restart]"
+  reg_has "$name" || die "unknown server: $name (see 'crc list')"
+  local dir f; dir="$(srv_dir "$name")"; f="$(mcp_file "$name")"
+
+  # No change requested: just report what the workspace declares.
+  if [ -z "$from" ] && [ -z "$add" ]; then
+    say "$name — $f"
+    mcp_show "$name"
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 || die "python3 is required to edit .mcp.json"
+
+  local src=""
+  if [ -n "$from" ]; then
+    reg_has "$from" || die "unknown server: $from"
+    src="$(srv_dir "$from")/.mcp.json"
+    [ -f "$src" ] || die "$from has no .mcp.json to copy"
+    [ -n "$add" ] && die "pass either --from or --add, not both"
+  else
+    [ -n "$url" ] || die "--add <key> needs --url <url>"
+  fi
+
+  if [ "${CRC_DRY_RUN:-0}" = 1 ]; then
+    say "[dry-run] would write $f${src:+ from $src}${add:+ (add $add -> $url)}${as:+ as $as}"
+    return 0
+  fi
+
+  # Merge, never clobber: a workspace may already declare servers worth keeping.
+  [ -f "$f" ] && cp "$f" "$f.bak"
+  local added
+  added="$(python3 - "$f" "${src:-}" "${add:-}" "${url:-}" "${as:-}" "$type" <<'PY'
+import json, os, sys
+dest, src, add, url, as_key, type_ = sys.argv[1:7]
+
+def load(path):
+    try:
+        return json.load(open(path)) or {}
+    except Exception:
+        return {}
+
+doc = load(dest)
+servers = doc.setdefault("mcpServers", {})
+added = []
+if src:
+    incoming = (load(src).get("mcpServers") or {})
+    if as_key and len(incoming) == 1:
+        # One server, renamed: the per-workspace naming these configs use means the
+        # key from another workspace is usually the wrong name here.
+        (_, cfg), = incoming.items()
+        servers[as_key] = cfg
+        added.append(as_key)
+    else:
+        for key, cfg in incoming.items():
+            servers[key] = cfg
+            added.append(key)
+else:
+    key = as_key or add
+    servers[key] = {"type": type_, "url": url}
+    added.append(key)
+
+json.dump(doc, open(dest, "w"), indent=2)
+open(dest, "a").write("\n")
+print(" ".join(added))
+PY
+)" || die "could not write $f"
+  say "$name: wrote $f (${added:-no change})"
+  mcp_show "$name"
+  [ -f "$f.bak" ] && say "(previous file kept at $f.bak)"
+  say ""
+  say "note: .mcp.json is part of the repo — commit it if this should follow the workspace."
+
+  if [ "$restart" = 1 ]; then
+    say ""
+    local live; live="$(srv_pids "$name" >/dev/null 2>&1 && pgrep -f -- "--session-id cse_" 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
+    say "restarting $name so its sessions load the new config"
+    srv_stop "$name"
+    sleep 3
+    srv_start "$name" || { warn "$name did not come back — 'crc doctor' has details"; return 1; }
+  else
+    say "run 'crc restart $name' when you are ready: sessions only read this at startup."
+  fi
+  say ""
+  say "then authenticate from a chat in that workspace:  /mcp"
+}
+
 # A running server with no environment means session creation is being refused.
 # The usual cause is not local: the repo is missing from the Claude GitHub App's
 # selection, so report it instead of leaving the user to grep a debug log.
@@ -1351,6 +1479,7 @@ main() {
     stop)         cmd_stop "$@" ;;
     remove|rm)    cmd_remove "$@" ;;
     trust)        cmd_trust "$@" ;;
+    mcp)          cmd_mcp "$@" ;;
     login)        cmd_login "$@" ;;
     account)      cmd_account "$@" ;;
     fork)         cmd_fork "$@" ;;
