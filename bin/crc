@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.7.1"
+VERSION="1.7.2"
 
 crc_migrate_legacy
 
@@ -270,8 +270,11 @@ cmd_trust() {
     tui_choose "$s" "Yes, I trust this folder" || warn "could not select the trust option"
     sleep 6
   fi
-  if tui_pane "$s" | grep -qi "MCP server"; then
-    tui_choose "$s" "Use this MCP server" || warn "could not select the MCP option"
+  # Match the dialog's own option line, not any mention of "MCP server": the status
+  # banner says things like "1 MCP server needs authentication", which is not a question
+  # and has nothing to select — reporting that as a failure made a clean run look broken.
+  if tui_pane "$s" | grep -q "Use this MCP server"; then
+    tui_choose "$s" "Use this MCP server" || warn "could not accept the MCP server dialog"
     sleep 6
   fi
 
