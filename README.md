@@ -44,6 +44,9 @@ Works on macOS (launchd) and Linux (systemd user timer). Requirements: `bash`, `
     crc remove work                 # asks whether to delete the directory
     crc remove work --purge         # delete it; --keep-dir to keep it
 
+    crc mcp work                    # what MCP servers this workspace declares
+    crc mcp work --from docs --as work_workspace   # copy another workspace's, renamed
+    crc mcp work --add cogniwork --url https://…   # add one, then restart the server
     crc sessions work               # chat sessions that can be revived, newest first
     crc revive cse_01ABC…           # reattach one, in its own worktree and branch
     crc revive cse_01ABC… --branch x  # ...on a branch you name instead
@@ -58,6 +61,23 @@ A failed start is reported as such: `crc start` / `crc restart` wait for the ser
 to come up and stay up, retry once, and exit non-zero if it does not.
 
 `CRC_DRY_RUN=1` makes any command print what it would do and change nothing.
+
+## MCP servers for a workspace
+
+Sessions read `.mcp.json` from the workspace directory **at startup**. Adding a server to a
+running chat does nothing — a remote-control session loads MCP servers only from the
+verified startup config on the machine, so the server has to be restarted before anything
+appears. `crc mcp` does both halves:
+
+    crc mcp <name>                                   # show what is declared
+    crc mcp <name> --add <key> --url <url>           # add an http server
+    crc mcp <name> --from <other> [--as <key>]       # copy another workspace's config
+    crc mcp <name> … --no-restart                    # edit only
+
+Entries are merged, never clobbered, and the previous file is kept as `.mcp.json.bak`.
+`--as` renames a copied server, which is usually what you want: these configs tend to be
+named per workspace. The file belongs to the repo — commit it if it should follow the
+workspace. Authentication is a separate step: run `/mcp` from a chat in that workspace.
 
 ## Signing in
 
