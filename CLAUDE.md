@@ -38,7 +38,7 @@ step. Assume every change ships to a running system.
    in-flight chat on the machine. Default to the named form, and say how many chats will die
    (`pgrep -f "sdk-url" | wc -l`) before doing it.
 3. **Match processes with the trailing space** — `pgrep -f "remote-control --name $n "`.
-   Without it, `100b` also matches `100bx`.
+   Without it, `work` also matches `workx`.
 4. **Check liveness on the process, never the tmux session.** A crashed `claude` leaves the
    session behind; session-based checks never notice and the server stays dead.
 5. **Never destroy user data on a guess.** `remove` deletes a directory only on an explicit

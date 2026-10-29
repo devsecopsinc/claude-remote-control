@@ -46,7 +46,7 @@ Works on macOS (launchd) and Linux (systemd user timer). Requirements: `bash`, `
 
     crc mcp work                    # what MCP servers this workspace declares
     crc mcp work --from docs --as work_workspace   # copy another workspace's, renamed
-    crc mcp work --add cogniwork --url https://…   # add one, then restart the server
+    crc mcp work --add example --url https://…     # add one, then restart the server
     crc sessions work               # chat sessions that can be revived, newest first
     crc revive cse_01ABC…           # reattach one, in its own worktree and branch
     crc revive cse_01ABC… --branch x  # ...on a branch you name instead

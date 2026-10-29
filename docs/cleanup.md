@@ -120,7 +120,7 @@ Environment ids must be the same as before: a changed id means saved links are d
 | | before | after |
 |---|---|---|
 | disk free | 18 GB (96% full) | 54 GB |
-| checklist worktrees | 199 | 91 |
+| worktrees in the busiest repo | 199 | 91 |
 | MCP processes | 134 | ~12 |
 | swap used | 29.8 / 30.7 GB | 21 / 26 GB |
 | logs | 2.2 GB | 1.6 GB |

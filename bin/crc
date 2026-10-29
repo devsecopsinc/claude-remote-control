@@ -1068,7 +1068,7 @@ fork_has()      { fork_names | grep -qxF "$1"; }
 fork_get()      { reg_get_raw "fork:$1" "$2"; }
 fork_dir()      { local d; d="$(fork_get "$1" dir)"; case "$d" in "~"/*) d="$HOME/${d#\~/}" ;; esac; echo "$d"; }
 # The name is the last argument, so there is no trailing space to match on; anchor on
-# end-of-string instead, or "checklist-6" matches "checklist-62t". Getting this wrong
+# end-of-string instead, or "work-6" matches "work-62t". Getting this wrong
 # makes every fork look stopped, and the supervisor starts a second copy of each.
 fork_running()  { pgrep -f -- "--remote-control $1(\$| )" >/dev/null 2>&1; }
 
