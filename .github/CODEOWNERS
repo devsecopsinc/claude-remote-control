@@ -1,2 +1,4 @@
-# Every change to this repository requires review by the owner.
-*       @kurianoff
+# Every change to this repository requires review by the owner or the team.
+# The team has no repo access yet, so GitHub will not request reviews from it
+# until devsecops-team is granted write access on this repository.
+*       @kurianoff @devsecopsinc/devsecops-team
