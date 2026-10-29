@@ -2,9 +2,9 @@
 # INI registry. Human-editable and greppable on purpose: the whole point of this file
 # is that you can read it, diff it, and check it into a dotfiles repo.
 #
-#   [checklist]
-#   dir             = /Users/you/github/checklist
-#   repo            = git@github.com:you/checklist.git
+#   [work]
+#   dir             = /Users/you/github/work
+#   repo            = git@github.com:you/work.git
 #   spawn           = worktree
 #   permission_mode = bypassPermissions
 #   enabled         = true

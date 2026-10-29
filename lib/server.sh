@@ -10,7 +10,7 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-# The trailing space is load-bearing: without it "100b " also matches "100bx".
+# The trailing space is load-bearing: without it "work " also matches "workx".
 srv_pids() { pgrep -f "remote-control --name $1 " 2>/dev/null || true; }
 srv_running() { [ -n "$(srv_pids "$1")" ]; }
 
