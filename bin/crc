@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.8.2"
+VERSION="1.8.3"
 
 crc_migrate_legacy
 
@@ -614,7 +614,11 @@ login_start() {
   tmux="$(crc_tmux)" || die "tmux not found"
   claude="$(crc_claude)" || die "claude not found"
   dir="$(login_dir)" || die "no trusted workspace to log in from — run 'crc trust <name>' first"
-  [ -n "${CRC_LOGIN_CONFIG:-}" ] && prefix="CLAUDE_CONFIG_DIR=$(printf '%q' "$CRC_LOGIN_CONFIG") "
+  # Keyed on the directory, not the name: the primary identity reads ~/.claude.json
+  # beside its directory, so pointing CLAUDE_CONFIG_DIR at ~/.claude would make the
+  # CLI look inside it instead and start onboarding a brand-new identity.
+  [ -n "${CRC_LOGIN_CONFIG:-}" ] && [ "$CRC_LOGIN_CONFIG" != "$HOME/.claude" ] \
+    && prefix="CLAUDE_CONFIG_DIR=$(printf '%q' "$CRC_LOGIN_CONFIG") "
 
   # An already-running flow still has a usable URL: hand back the same one rather
   # than starting a second sign-in the user did not ask for.
@@ -765,9 +769,12 @@ EOF
 # signed in are affected: the others hold their own credentials and restarting
 # them would interrupt live chats for nothing. Say what it costs before doing it.
 login_restart() {
-  local account="${1:-default}" n pid names="" live=0
+  local account="${1:-default}" n pid names="" live=0 want
+  # Compare resolved identities, not names: a registry may call the primary identity
+  # anything it likes, and every such name must select the same servers.
+  want="$(acct_dir "$account")" || return 0
   for n in $(reg_names); do
-    [ "$(srv_account "$n")" = "$account" ] || continue
+    [ "$(srv_config_dir "$n" 2>/dev/null)" = "$want" ] || continue
     srv_running "$n" || continue
     names="$names $n"
     for pid in $(srv_pids "$n"); do
@@ -790,9 +797,10 @@ login_restart() {
 # blames the machine. Restarting one mints a new session link, which is not a price
 # to pay on the user's behalf, so say it and let them choose.
 login_warn_forks() {
-  local account="$1" f stale=""
+  local account="$1" f stale="" want
+  want="$(acct_dir "$account")" || return 0
   for f in $(fork_names); do
-    [ "$(fork_get "$f" account)" = "$account" ] || continue
+    [ "$(acct_dir "$(fork_get "$f" account)" 2>/dev/null)" = "$want" ] || continue
     fork_running "$f" || continue
     stale="$stale $f"
   done
