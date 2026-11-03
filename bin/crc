@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.8.1"
+VERSION="1.8.2"
 
 crc_migrate_legacy
 
@@ -782,6 +782,25 @@ login_restart() {
   say "restarting the servers bound to '$account' so they pick up the new credentials:${names} (${live} chat session(s) will be interrupted)"
   # shellcheck disable=SC2086
   cmd_restart $names
+  login_warn_forks "$account"
+}
+
+# Forks are standalone processes, not children of any server, so a server restart
+# leaves them on the credentials they started with — they keep failing, and the app
+# blames the machine. Restarting one mints a new session link, which is not a price
+# to pay on the user's behalf, so say it and let them choose.
+login_warn_forks() {
+  local account="$1" f stale=""
+  for f in $(fork_names); do
+    [ "$(fork_get "$f" account)" = "$account" ] || continue
+    fork_running "$f" || continue
+    stale="$stale $f"
+  done
+  [ -n "$stale" ] || return 0
+  say ""
+  warn "these forks also run as '$account' and were NOT restarted:$stale"
+  warn "they still hold the credentials they started with and will fail on their next message."
+  warn "restart one with: crc forks stop <name> && crc forks start <name>  (each restart mints a new session link)"
 }
 
 # ---------------------------------------------------------------------------

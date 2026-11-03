@@ -108,6 +108,12 @@ servers — and interrupts their live chats. That is unavoidable, not an oversig
 the servers bound to the identity that just signed in are restarted; the rest hold their
 own credentials and are left alone.
 
+Forks are not servers. They are standalone processes, so a server restart leaves them on
+the credentials they started with and they fail on their next message — with the app
+blaming the machine rather than the token. `crc login` names the ones that are affected
+instead of restarting them, because each fork restart mints a new session link and that
+is not a price to pay on your behalf.
+
 ## Two subscriptions, one machine
 
 A chat belongs to the account that created it. Two accounts cannot share a session, and
