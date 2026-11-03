@@ -88,13 +88,14 @@ recovers on its own, and `/login` does not exist inside a remote-control session
 
     crc login                 # prints a URL, waits for the code, restarts the servers
     crc login --no-restart    # ...leave the servers alone
+    crc login --account second   # sign a second identity in; restarts only its servers
 
 The sign-in needs a browser and a code pasted back, so it cannot be fully automated. The
 steps are also separate commands, so something else — a phone, a small local web service —
 can drive the same flow without holding a terminal open:
 
     crc login start [--json]  # {"url": "https://claude.com/cai/oauth/authorize?..."}
-    crc login code <code>     # completes it, then restarts the servers
+    crc login code <code>     # completes it, then restarts that identity's servers
     crc login status [--json] # {"state":"ok","expires_at":…,"refresh_token":true,…}
     crc login cancel
 
@@ -103,7 +104,9 @@ beginning a second sign-in. `crc doctor` reports the same credential state, incl
 the empty-record case, so a broken token shows up before every server does.
 
 New credentials are only read at process start, which is why logging in restarts the
-servers — and interrupts every live chat. That is unavoidable, not an oversight.
+servers — and interrupts their live chats. That is unavoidable, not an oversight. Only
+the servers bound to the identity that just signed in are restarted; the rest hold their
+own credentials and are left alone.
 
 ## Two subscriptions, one machine
 
@@ -113,7 +116,7 @@ share is the machine and the worktree on it — `CLAUDE_CONFIG_DIR` gives each a
 complete, separate Claude identity (credentials, transcripts, settings, trust).
 
     crc account add second            # ~/.claude-second, settings copied from the primary
-    crc login --account second        # sign it in; the servers are left alone
+    crc login --account second        # sign it in; restarts only this identity's servers
     crc account list                  # who each identity is signed in as
     crc add work2 --dir ~/github/work --account second   # a server that runs as that identity
 

@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 
 crc_migrate_legacy
 
@@ -529,7 +529,7 @@ cmd_sessions() {
 # small local web service — can drive it without holding a terminal open:
 #
 #   crc login start          prints the URL to open
-#   crc login code <code>    completes it and restarts the servers
+#   crc login code <code>    completes it and restarts that identity's servers
 #
 # Both steps talk to one tmux session running the real CLI. Driving the CLI beats
 # reimplementing the OAuth exchange: the token endpoint and the credential file
@@ -702,12 +702,10 @@ cmd_login() {
       *) if [ -z "$sub" ]; then sub="$1"; else code="$1"; fi; shift ;;
     esac
   done
-  if [ -n "$account" ] && [ "$account" != default ]; then
+  [ -n "$account" ] || account=default
+  if [ "$account" != default ]; then
     CRC_LOGIN_CONFIG="$(acct_dir "$account")" || die "unknown account: $account (crc account add $account)"
     export CRC_LOGIN_CONFIG
-    # The servers run under the default identity; restarting them on behalf of a
-    # second account would interrupt every live chat for nothing.
-    restart=0
   fi
 
   case "$sub" in
@@ -739,7 +737,7 @@ EOF
     login_code "$code" || return 1
     say "logged in"
     auth_report
-    [ "$restart" = 1 ] && login_restart
+    [ "$restart" = 1 ] && login_restart "$account"
     return 0 ;;
   cancel) login_cancel; return 0 ;;
   "")     ;;                      # interactive flow, below
@@ -758,17 +756,32 @@ EOF
   login_code "$entered" || return 1
   say "logged in"
   auth_report
-  [ "$restart" = 1 ] && login_restart
+  [ "$restart" = 1 ] && login_restart "$account"
   return 0
 }
 
 # New credentials are read at process start, so running chats keep failing until
-# their server is restarted. Say what that costs before doing it.
+# their server is restarted. Only the servers bound to the identity that just
+# signed in are affected: the others hold their own credentials and restarting
+# them would interrupt live chats for nothing. Say what it costs before doing it.
 login_restart() {
-  local live; live="$(pgrep -f 'sdk-url' 2>/dev/null | wc -l | tr -d ' ')"
+  local account="${1:-default}" n pid names="" live=0
+  for n in $(reg_names); do
+    [ "$(srv_account "$n")" = "$account" ] || continue
+    srv_running "$n" || continue
+    names="$names $n"
+    for pid in $(srv_pids "$n"); do
+      live=$(( live + $(pgrep -P "$pid" 2>/dev/null | wc -l | tr -d ' ') ))
+    done
+  done
   say ""
-  say "restarting all servers so they pick up the new credentials (${live:-0} chat session(s) will be interrupted)"
-  cmd_restart --all
+  if [ -z "$names" ]; then
+    say "no running server is bound to account '$account' — nothing to restart"
+    return 0
+  fi
+  say "restarting the servers bound to '$account' so they pick up the new credentials:${names} (${live} chat session(s) will be interrupted)"
+  # shellcheck disable=SC2086
+  cmd_restart $names
 }
 
 # ---------------------------------------------------------------------------
