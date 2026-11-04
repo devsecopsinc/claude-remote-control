@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.8.3"
+VERSION="1.9.0"
 
 crc_migrate_legacy
 
@@ -47,6 +47,7 @@ usage: crc <command> [args]
                                 continue a chat under another account, same worktree
   forks <list|start|stop|forget>
                                 forked chats the supervisor keeps alive
+  hooks [--all | <worktree>...] (re)install the shared-log hooks in a worktree
   handoff <session-id>          append what a chat just did to the shared log
   sessions <name>               list revivable chat sessions, newest first
   revive <session-id> [server] [--branch <name>]
@@ -926,10 +927,16 @@ def install(event, matcher, mode):
         for h in group.get("hooks", []):
             if h.get("command") == cmd:
                 return
-    entries.append({"matcher": matcher, "hooks": [{"type": "command", "command": cmd, "timeout": 15}]})
+    group = {"hooks": [{"type": "command", "command": cmd, "timeout": 15}]}
+    if matcher:                       # UserPromptSubmit has no matchers; it always fires
+        group["matcher"] = matcher
+    entries.append(group)
     changed.append(event)
 install("Stop", "*", "stop")
 install("SessionStart", "startup|resume|fork", "start")
+# Without this one the log is only ever read at a session start, so a chat that is
+# already running learns nothing until it restarts — the case the log is for.
+install("UserPromptSubmit", "", "turn")
 if changed:
     json.dump(cfg, open(path, "w"), indent=2)
     open(path, "a").write("\n")
@@ -937,6 +944,47 @@ print(",".join(changed) if changed else "already installed")
 PY
 )" || { warn "could not install the shared-log hooks"; return 1; }
   say "shared log hooks: $out"
+}
+
+# Installing the hooks is its own command because the set grows: a worktree set up by
+# an older crc carries an older pair, and the chats sitting in it never read the log at
+# a message until the file is rewritten. Re-running this is safe — each hook is matched
+# by its exact command line and added only if absent.
+cmd_hooks() {
+  local all=0 dirs="" n d w
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) dirs="$dirs $1"; shift ;;
+    esac
+  done
+  if [ "$all" = 1 ]; then
+    for n in $(fork_names); do
+      d="$(fork_dir "$n" 2>/dev/null || echo '')"
+      [ -n "$d" ] && [ -d "$d" ] && dirs="$dirs $d"
+    done
+    for n in $(reg_names); do
+      d="$(srv_dir "$n" 2>/dev/null || echo '')"
+      [ -n "$d" ] || continue
+      for w in "$d"/.claude/worktrees/bridge-*; do
+        [ -d "$w" ] && dirs="$dirs $w"
+      done
+    done
+  fi
+  if [ -z "$dirs" ]; then
+    [ "$all" = 1 ] && { say "no chat worktrees found — nothing to install into"; return 0; }
+    die "usage: crc hooks [--all | <worktree>...]"
+  fi
+  for d in $dirs; do
+    [ -d "$d" ] || { warn "$d: no such directory"; continue; }
+    say "$d"
+    fork_hooks_install "$d" || true
+  done
+  say ""
+  say "a chat already running reads its new hooks only after a restart:"
+  say "  crc restart-session <session-id>     (a server's chat)"
+  say "  crc forks stop <name> && crc forks start <name>   (a fork — mints a new link)"
 }
 
 cmd_fork() {
@@ -1523,6 +1571,7 @@ main() {
     login)        cmd_login "$@" ;;
     account)      cmd_account "$@" ;;
     fork)         cmd_fork "$@" ;;
+    hooks)        cmd_hooks "$@" ;;
     forks)        cmd_forks "$@" ;;
     handoff)      cmd_handoff "$@" ;;
     revive)       cmd_revive "$@" ;;
