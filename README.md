@@ -160,12 +160,16 @@ a new transcript, so the newest one for that worktree under that account is what
 
 ### The shared log
 
-Once two sessions work one worktree they diverge immediately, so `crc fork` installs two
-hooks there (`hooks/session-log.py`, also installable by hand):
+Once two sessions work one worktree they diverge immediately, so `crc fork` installs three
+hooks there (`hooks/session-log.py`, also installable with `crc hooks`):
 
 - **Stop** — appends what the turn did: branch, HEAD, commits added, files touched, and the
   closing message. Facts first, because prose drifts and git does not.
-- **SessionStart** — injects what the *other* accounts did while this session was away.
+- **UserPromptSubmit** — injects what the other accounts have logged since this session's
+  last message. This is the one that matters while both sides are working: a session that is
+  already running picks the other up at its next message, with no restart. Silent when there
+  is nothing new, which is almost every message.
+- **SessionStart** — injects what the other accounts did while this session was away.
 
 It is built for the ways this goes wrong:
 
@@ -178,8 +182,14 @@ It is built for the ways this goes wrong:
   the tokens re-sent, so both sides can see where the other's picture of the work was
   rebuilt — and the injected text says to trust the tree over any summary.
 
+    crc hooks --all                                # (re)install in every server worktree
+                                                   # and every supervised fork
     crc handoff cse_01ABC… --from-account second   # log an entry by hand, for chats
                                                    # that started before the hooks existed
+
+A chat reads the hook file at process start, so a worktree that was set up by an older `crc`
+needs `crc hooks` **and** a restart of the chats sitting in it before they read the log at a
+message. `crc hooks` prints the restart commands.
 
 The log lives in `~/.crc/session-logs/`, never in the repo.
 
