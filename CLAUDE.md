@@ -6,14 +6,18 @@ Read `README.md` for the user-facing picture before changing code.
 
 ## Layout
 
-    bin/crc            CLI: list add start restart restart-session stop remove login account fork hooks handoff trust sessions revive tick doctor supervise env
+    bin/crc            CLI: list add start restart restart-session stop remove login account fork switch transcripts hooks handoff trust sessions revive tick doctor supervise env
     lib/platform.sh    OS detection, tool discovery, paths, network probe
     lib/registry.sh    INI read/write (awk; no dependencies)
-    lib/server.sh      one server's lifecycle: preflight, start, stop, state, env id
+    lib/server.sh      one server's lifecycle: preflight, start, stop, state, env id,
+                       and trust_root/trust_ok/trust_conf — identity trust, keyed on
+                       the config dir and on the repo root (not the worktree)
     hooks/             session-log.py: the Stop / UserPromptSubmit / SessionStart set
                        that keeps two accounts' sessions aware of each other in a
                        shared worktree. One watermark per reader gates all reads, so
                        adding a read point can never double-inject an entry.
+                       transcript-claim.py: the UserPromptSubmit guard that blocks a
+                       prompt in the account that does not hold a shared transcript.
     install.sh         symlink onto PATH, optionally install the supervisor
 
 Config is `~/.crc/servers.ini`; logs follow platform convention (`~/Library/Logs/...` on
@@ -56,8 +60,42 @@ step. Assume every change ships to a running system.
 9. **Portability**: bash 3.2 (what macOS ships) — no associative arrays, no `mapfile`, no
    `${var,,}`. No GNU-only flags: `sed -i` and `date -d` differ on BSD. Prefer awk.
 10. **No new runtime dependencies.** bash, tmux, git, coreutils, awk, sed. `gh` is optional
-    and only for `crc add --create`. python3 is used for one optional trust check and must
-    stay optional.
+    and only for `crc add --create`. python3 is required for the shared log, the transcript
+    guard and `crc transcripts check`; it stays *optional* for servers, trust and everything
+    `crc tick` does, so a box without it still runs.
+11. **Never move a transcript that something is writing.** A live session opens the file per
+    write, so a `mv` under its feet loses whatever it appends next, without an error.
+    `crc transcripts centralize` refuses on a live writer; keep that refusal.
+
+## One transcript, two identities
+
+`crc switch` moves a chat between accounts by giving both identities a symlink to one
+transcript file under `~/.claude-transcripts/` (`CRC_TRANSCRIPT_HOME`). The mechanics are
+load-bearing and were established by measurement, not documentation:
+
+- Claude Code **appends in place** — opens the file per write, appends, closes, never
+  renames, holds no handle. That is why a symlink works and why the file can be moved while
+  nothing is resuming it.
+- `--resume <uuid>` **without** `--fork-session` continues the same file. `--fork-session`
+  mints a new uuid, which is exactly what sharing must not do. A registry entry carrying a
+  `uuid` key is pinned: resume that id, no `--fork-session`.
+- The jsonl is a **tree**, not a chain (`uuid` / `parentUuid`). Two sessions resuming one
+  file attach to the same parent; the file keeps both branches and the next resume follows
+  one. The dropped branch throws nothing and logs nothing. Verified: 81 valid lines, two
+  children of one parent, one account's work gone from the conversation.
+
+So **one writer per chat** is the invariant, enforced in two places that must both stay:
+
+1. `tx_writers` — every crc-driven resume refuses while another writer lives. It returns 2
+   when it could not read the process table at all, and callers refuse on that too: "I could
+   not look" is not "nothing is there". Do not collapse those cases.
+2. `hooks/transcript-claim.py` — blocks the first message of a session whose identity is not
+   the claim holder. crc cannot cover this itself: a remote-control server respawns its own
+   chat whenever the chat is messaged in the app. The guard fails *open* on its own errors
+   (breaking the session is worse than the race) but never on a claim it successfully read.
+
+`crc transcripts check` is the only way to see the damage after the fact — it looks for rows
+with two children. Keep it working; nothing else reports this failure.
 
 ## Worktrees belong to sessions
 
@@ -73,6 +111,16 @@ timer**: the option order varies between repos (a cloned private repo put `No, e
 so a blind Enter can answer the opposite of what was intended. Use `tui_choose`, which finds
 the line matching the wanted option, moves the `❯` cursor onto it, and gives up rather than
 sending keys into a dialog it does not recognise.
+
+Two things about trust that cost a debugging session each, both verified on 2.1.319:
+
+- **Trust is recorded against the main worktree, not the linked one.** Answering the dialog
+  inside `<repo>/.claude/worktrees/bridge-cse_…` writes the entry for `<repo>`; the worktree
+  path is never added. A check that asks about the worktree is false forever — which is why
+  `trust_root` exists, and why the primary identity has one worktree entry for 49 worktrees.
+- **`claude --print` never shows the dialog** and records nothing, so a headless run proves
+  nothing about trust. Testing with `--print` is what made it look as though the dialog had
+  been removed from the product.
 
 ## Verifying a start
 

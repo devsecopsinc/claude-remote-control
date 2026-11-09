@@ -140,7 +140,8 @@ The conversation cannot move, but its transcript is a file and the local session
 derived from the cloud one, so the second identity can resume it. You get a *new* session,
 owned by the second account, carrying the history, in the same worktree on the same branch.
 It appears in that account's app; the original is untouched. `--fork-session` keeps the two
-transcripts separate, so the first account's chat still has its own.
+transcripts separate, so the first account's chat still has its own — which is also why a fork
+is a one-way handover. To move a chat back and forth instead, see **crc switch** below.
 
 ### Keeping forks alive
 
@@ -158,10 +159,67 @@ What is recorded is the worktree and the identity, not a transcript id: every re
 a new transcript, so the newest one for that worktree under that account is what gets resumed
 — a restarted fork continues from where it actually is, not from where it was forked.
 
+An entry recorded by `crc switch` is the exception: it carries a `uuid`, shares that one
+transcript with the account that owns the chat, and is resumed by name without
+`--fork-session`. `crc forks` shows which is which in the TRANSCRIPT column.
+
+### Moving one chat back and forth
+
+`crc fork` hands a chat over **once**: it copies the transcript and takes a new session id
+with `--fork-session`, so the two accounts diverge from that moment. Good for "finish this
+under the other subscription", useless for going back when the first one resets.
+
+`crc switch` shares the file instead:
+
+    crc switch cse_01ABC… --to second      # second account continues it
+    crc switch cse_01ABC… --to default     # and back again, later
+
+The transcript moves to `~/.claude-transcripts/<worktree>/<uuid>.jsonl` and every identity on
+the machine gets a symlink to it at its own `projects/<worktree>/<uuid>.jsonl`. One file, so
+each side arrives holding everything the other one did and there is never a question of which
+copy is newer. The claude.ai link changes on every switch; the conversation does not.
+
+Switching **to the account whose server owns the chat** stops the fork and hands the chat back
+to that server — message it in the app and the server resumes it, carrying the other account's
+work. Switching to any other account starts a supervised entry that `crc tick` keeps alive,
+pinned to that transcript (`uuid =` in the registry) and resumed *without* `--fork-session`.
+
+    crc transcripts                        # per chat: shared? how many links? who holds it?
+    crc transcripts centralize --all       # share the transcripts of every chat
+    crc transcripts check                  # look for the damage described below
+    crc transcripts release cse_01ABC…     # drop the claim (no exclusivity after that)
+
+#### One writer per chat
+
+Both accounts can be busy at once — ten chats under one and ten under the other is fine. What
+cannot happen is **one chat running under both**. That is per chat, not per account.
+
+The transcript is a tree, not a chain: rows carry `uuid` and `parentUuid`. Two sessions
+prompted at the same time attach to the same parent, so the file keeps both branches, the next
+resume follows one, and the other is dropped. Measured, not guessed: two accounts prompted
+together produced 81 valid lines, two children of one parent, and a reply that had never heard
+of half of them. Nothing errored. Nothing was corrupt. One account's work simply stopped
+existing — which is worse than a crash, because a crash tells you.
+
+So exclusivity is enforced twice:
+
+- **crc refuses.** `crc switch` stops the current holder and will not start the next one while
+  anything is still writing; a pinned fork refuses the same way, including when the supervisor
+  is the one asking. If the process list cannot be read at all, that is a refusal too — "I
+  could not look" is not "nothing is there".
+- **The worktree refuses.** `crc switch` writes a claim beside the transcript, and the
+  `transcript-claim.py` UserPromptSubmit hook blocks the first message of any session whose
+  identity is not the holder. This is the half crc cannot do by itself: a remote-control
+  server respawns its own chat whenever the chat gets a message in the app, and crc gets no
+  say in that. The hook's message names the holder and the command to take the chat over.
+
+`crc doctor` reports two forks pinned to one transcript, and links whose target is gone.
+
 ### The shared log
 
-Once two sessions work one worktree they diverge immediately, so `crc fork` installs three
-hooks there (`hooks/session-log.py`, also installable with `crc hooks`):
+Once two sessions work one worktree they diverge immediately, so `crc fork` and `crc switch`
+install three hooks there (`hooks/session-log.py`, also installable with `crc hooks`), beside
+the `transcript-claim.py` guard described above:
 
 - **Stop** — appends what the turn did: branch, HEAD, commits added, files touched, and the
   closing message. Facts first, because prose drifts and git does not.
@@ -208,6 +266,7 @@ Config lives in `~/.crc`; logs go where the platform keeps logs. Override either
 `CRC_HOME`, `CRC_REGISTRY`, or `CRC_LOG_DIR`.
 
     ~/.crc/servers.ini                              the registry
+    ~/.claude-transcripts/<worktree>/               shared transcripts (CRC_TRANSCRIPT_HOME)
     ~/Library/Logs/claude-remote-control/           logs (macOS)
     ${XDG_STATE_HOME:-~/.local/state}/claude-remote-control/logs/   logs (Linux)
 

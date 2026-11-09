@@ -30,6 +30,47 @@ srv_dir() {
   echo "$d"
 }
 
+# Trust is recorded per directory in the identity's config file, and without it a
+# server — or a chat resumed by another account — exits at once. The primary identity
+# keeps that file beside ~/.claude; a CLAUDE_CONFIG_DIR identity keeps it inside.
+trust_conf() {
+  if [ "$1" = "$HOME/.claude" ]; then echo "$HOME/.claude.json"; else echo "$1/.claude.json"; fi
+}
+
+# Claude Code records trust against the **main worktree** of a repository, not the
+# linked worktree you are standing in: answering the dialog inside
+# <repo>/.claude/worktrees/bridge-cse_… writes the entry for <repo>. Verified on
+# 2.1.319 by answering it and diffing the config — the worktree path was never added.
+#
+# A trust check that asks about the worktree is therefore false forever, which made
+# 'crc switch' refuse a handover the CLI would have allowed. Ask about the repo.
+trust_root() {
+  local dir="$1" git common root
+  git="$(crc_git 2>/dev/null)" || { printf '%s\n' "$dir"; return 0; }
+  common="$(cd "$dir" 2>/dev/null && "$git" rev-parse --git-common-dir 2>/dev/null)" || common=""
+  [ -n "$common" ] || { printf '%s\n' "$dir"; return 0; }
+  case "$common" in /*) ;; *) common="$dir/$common" ;; esac
+  root="$(cd "$common/.." 2>/dev/null && pwd)" || root=""
+  printf '%s\n' "${root:-$dir}"
+}
+
+trust_ok() {
+  local dir conf
+  dir="$(trust_root "$1")"
+  conf="$(trust_conf "$2")"
+  [ -f "$conf" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$dir" "$conf" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[2]))
+except Exception:
+    sys.exit(0)                       # unreadable: do not block on a guess
+proj = (d.get("projects") or {}).get(sys.argv[1])
+sys.exit(0 if (proj or {}).get("hasTrustDialogAccepted") else 1)
+PY
+}
+
 # Is this directory ready to host a server? Two failures we hit repeatedly.
 srv_preflight() {
   local name="$1" dir problems=""
@@ -39,23 +80,9 @@ srv_preflight() {
     "$(crc_git)" -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
       || problems="$problems not-a-git-repo(worktree-spawn-requires-one)"
   fi
-  # Trust is recorded per directory in the identity's config file; without it the
-  # server exits at once. The primary keeps that file beside ~/.claude, not inside it.
-  local cfgdir conf
+  local cfgdir
   cfgdir="$(srv_config_dir "$name" 2>/dev/null || echo "$HOME/.claude")"
-  if [ "$cfgdir" = "$HOME/.claude" ]; then conf="$HOME/.claude.json"; else conf="$cfgdir/.claude.json"; fi
-  if [ -f "$conf" ] && command -v python3 >/dev/null 2>&1; then
-    python3 - "$dir" "$conf" <<'PY' || problems="$problems workspace-not-trusted(run:'crc trust NAME')"
-import json, os, sys
-p = sys.argv[2]
-try:
-    d = json.load(open(p))
-except Exception:
-    sys.exit(0)                       # unreadable: do not block on a guess
-proj = d.get("projects", {}).get(sys.argv[1])
-sys.exit(0 if (proj or {}).get("hasTrustDialogAccepted") else 1)
-PY
-  fi
+  trust_ok "$dir" "$cfgdir" || problems="$problems workspace-not-trusted(run:'crc trust NAME')"
   [ -n "$problems" ] && { echo "${problems# }"; return 1; }
   return 0
 }
