@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.9.1"
+VERSION="1.10.0"
 
 crc_migrate_legacy
 
@@ -45,9 +45,13 @@ usage: crc <command> [args]
   account <add|list|remove>     a second subscription, as its own Claude identity
   fork <session-id> --account <name>
                                 continue a chat under another account, same worktree
+  switch <session-id> --to <account> [--no-start]
+                                move one chat between accounts, same transcript
+  transcripts <list|centralize|release|check>
+                                the shared transcript files switching runs on
   forks <list|start|stop|forget>
                                 forked chats the supervisor keeps alive
-  hooks [--all | <worktree>...] (re)install the shared-log hooks in a worktree
+  hooks [--all | <worktree>...] (re)install a worktree's shared-log + guard hooks
   handoff <session-id>          append what a chat just did to the shared log
   sessions <name>               list revivable chat sessions, newest first
   revive <session-id> [server] [--branch <name>]
@@ -73,6 +77,7 @@ add options:
 global:
   CRC_DRY_RUN=1                 print what would happen, change nothing
   CRC_HOME                      state dir: registry + logs (default ~/.crc)
+  CRC_TRANSCRIPT_HOME           shared transcripts (default ~/.claude-transcripts)
 EOF
 }
 
@@ -254,12 +259,14 @@ tui_choose() {
   return 1
 }
 
-cmd_trust() {
-  local name="${1:-}"; [ -n "$name" ] || die "usage: crc trust <name>"
-  reg_has "$name" || die "unknown server: $name"
-  local dir tmux claude s cfgdir prefix=""; dir="$(srv_dir "$name")"
-  tmux="$(crc_tmux)"; claude="$(crc_claude)"; s="crc-trust-$$"
-  cfgdir="$(srv_config_dir "$name" 2>/dev/null || echo "$HOME/.claude")"
+# Answer the one-time dialogs for one directory under one identity, and report
+# whether the identity trusts it afterwards. Keyed on the config dir rather than an
+# account name, because that is what the CLI actually keys on — and because a chat
+# handed to a second account needs the same dialog answered for the same worktree,
+# which is the step that used to be done by hand with tmux send-keys.
+trust_accept() {
+  local dir="$1" cfgdir="$2" tmux claude s prefix="" saw=0
+  tmux="$(crc_tmux)"; claude="$(crc_claude)"; s="crc-trust-$$-${RANDOM:-0}"
   [ "$cfgdir" = "$HOME/.claude" ] || prefix="CLAUDE_CONFIG_DIR=$(printf '%q' "$cfgdir") "
   if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would accept dialogs in $dir"; return 0; fi
 
@@ -270,7 +277,8 @@ cmd_trust() {
   sleep 10
 
   if tui_pane "$s" | grep -q "trust this folder"; then
-    tui_choose "$s" "Yes, I trust this folder" || warn "could not select the trust option"
+    saw=1
+    tui_choose "$s" "Yes, I trust this folder" || { warn "could not select the trust option"; saw=2; }
     sleep 6
   fi
   # Match the dialog's own option line, not any mention of "MCP server": the status
@@ -284,6 +292,22 @@ cmd_trust() {
   "$tmux" send-keys -t "${s}:0.0" "/exit" C-m
   sleep 4
   "$tmux" kill-session -t "=$s" 2>/dev/null || true
+
+  # A dialog that was on screen and could not be answered is a failure: something is
+  # waiting for an answer nobody will give.
+  [ "$saw" = 2 ] && { warn "the trust dialog was on screen and could not be answered"; return 1; }
+  trust_ok "$dir" "$cfgdir" && return 0
+  [ "$saw" = 0 ] && warn "no trust dialog appeared, and $(trust_root "$dir") is still not recorded as trusted"
+  return 1
+}
+
+cmd_trust() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: crc trust <name>"
+  reg_has "$name" || die "unknown server: $name"
+  local dir cfgdir; dir="$(srv_dir "$name")"
+  cfgdir="$(srv_config_dir "$name" 2>/dev/null || echo "$HOME/.claude")"
+  trust_accept "$dir" "$cfgdir" || true
+  [ "${CRC_DRY_RUN:-0}" = 1 ] && return 0
 
   if srv_preflight "$name" >/dev/null; then say "$name: ready"
   else warn "$name is still not ready. Accept the dialogs by hand:  cd $dir && claude"; return 1; fi
@@ -337,6 +361,196 @@ cmd_remove() {
 # named after the path with every / . and _ replaced by a dash.
 crc_project_dir() {
   printf '%s/.claude/projects/%s\n' "$HOME" "$(printf '%s' "$1" | sed 's|[/._]|-|g')"
+}
+
+# ---------------------------------------------------------------------------
+# Centralized transcripts.
+#
+# A transcript is a plain file Claude Code appends to in place: it opens it per
+# write, appends, closes, and never renames. So one file can be *the* transcript of
+# two identities at once — each keeps a symlink to it at its own
+# projects/<mangled>/<uuid>.jsonl, and whichever account is running reads everything
+# the other one wrote. That is what makes handing a conversation to a second
+# subscription cheap: there is one file, so there is never a question of which copy
+# is newer, and nothing to merge.
+#
+# The one thing it cannot survive is two sessions resuming it at once. The jsonl is
+# a tree, not a chain — rows carry uuid and parentUuid — so concurrent writers attach
+# to the same parent, and the next resume follows one branch and silently drops the
+# other. Measured, not theorised: two accounts prompted together produced 81 valid
+# lines, two children of one parent, and a reply that had never heard of half of them.
+# Nothing errored; nothing was corrupt; one account's work simply stopped existing.
+#
+# So sharing is only safe with exclusive use, enforced in two places:
+#   * every crc-driven resume refuses while another writer lives (tx_writers), and
+#   * the holder is written to a claim file beside the transcript, which the
+#     worktree's UserPromptSubmit guard enforces on sessions crc did not start —
+#     a server respawns its own chat on a message, and crc gets no say in that.
+
+crc_mangle() { printf '%s' "$1" | sed 's|[/._]|-|g'; }
+tx_home()    { echo "${CRC_TRANSCRIPT_HOME:-$HOME/.claude-transcripts}"; }
+tx_dir()     { printf '%s/%s\n' "$(tx_home)" "$(crc_mangle "$1")"; }
+# An identity's project directory for a worktree: tx_proj <config dir> <worktree>
+tx_proj()    { printf '%s/projects/%s\n' "$1" "$(crc_mangle "$2")"; }
+
+json_str() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
+
+# Every identity on this machine: the primary, plus each registered account.
+tx_config_dirs() {
+  { echo "$HOME/.claude"
+    local f; f="$(reg_file)"
+    [ -f "$f" ] && awk '/^[[:space:]]*\[/ {
+             s=$0; sub(/^[[:space:]]*\[/,"",s); sub(/\][[:space:]]*$/,"",s); sec=s; next
+           }
+           sec == "accounts" && /=/ {
+             k=$0; sub(/=.*$/,"",k); gsub(/[[:space:]]/,"",k); if (k != "") print k
+           }' "$f" | while IFS= read -r n; do acct_dir "$n" 2>/dev/null || true; done
+  } | awk 'NF && !seen[$0]++'
+}
+
+# Which registered workspace owns a chat, named by the worktree its id implies.
+# Prints "<repo> <server>". The worktree may be gone; the transcripts outlive it, so
+# an identity still holding transcripts for that path counts as proof too.
+chat_owner() {
+  local sid="$1" n d wt c
+  for n in $(reg_names); do
+    d="$(srv_dir "$n" 2>/dev/null || echo '')"
+    [ -n "$d" ] || continue
+    wt="$d/.claude/worktrees/bridge-$sid"
+    [ -d "$wt" ] && { printf '%s %s\n' "$d" "$n"; return 0; }
+    for c in $(tx_config_dirs); do
+      [ -d "$(tx_proj "$c" "$wt")" ] && { printf '%s %s\n' "$d" "$n"; return 0; }
+    done
+  done
+  return 1
+}
+
+# The transcript a chat *is*: the centralized file if there is one, otherwise the
+# newest any identity holds for that worktree. Two centralized files for one worktree
+# is ambiguity crc will not resolve on the user's behalf — it names both and stops,
+# because picking one would silently retire a conversation.
+tx_uuid() {
+  local wt="$1" central n f cfg files=""
+  central="$(tx_dir "$wt")"
+  if [ -d "$central" ]; then
+    n="$(ls "$central"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${n:-0}" -gt 1 ]; then
+      warn "more than one centralized transcript for $wt:"
+      ls "$central"/*.jsonl >&2
+      warn "keep the one this chat should continue and move the others out of $central"
+      return 1
+    fi
+    if [ "${n:-0}" = 1 ]; then basename "$(ls "$central"/*.jsonl)" .jsonl; return 0; fi
+  fi
+  for cfg in $(tx_config_dirs); do
+    for f in "$(tx_proj "$cfg" "$wt")"/*.jsonl; do
+      [ -f "$f" ] && files="$files $f"
+    done
+  done
+  # shellcheck disable=SC2086
+  [ -n "$files" ] && f="$(ls -t $files 2>/dev/null | head -1)" || f=""
+  [ -n "$f" ] || { warn "no transcript for $wt under any identity on this machine"; return 1; }
+  basename "$f" .jsonl
+}
+
+# pgrep that tells "nothing matched" apart from "could not look". pgrep exits 1 when
+# nothing matched and 2 or 3 when it failed — an unreadable process table, which a
+# sandbox or a stripped container will hand you. Collapsing those into "nothing is
+# running" is how you start a second writer on a transcript that already has one, so
+# this returns 2 and the callers refuse rather than guess.
+tx_pgrep() {
+  local out rc
+  out="$(pgrep -f -- "$1" 2>/dev/null)"; rc=$?
+  if [ "$rc" -gt 1 ]; then
+    warn "cannot read the process list (pgrep exit $rc) while looking for '$1'"
+    return 2
+  fi
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return 0
+}
+
+# Processes that would write this transcript. A server's own chat runs as
+# "--session-id cse_…"; anything crc resumed runs as "--resume <uuid>". Both have to
+# be checked: a shared transcript has one of each kind of writer. Returns 2 when it
+# could not find out, which is never the same answer as "none".
+tx_writers() {
+  local sid="${1:-}" uuid="${2:-}" a="" b=""
+  [ -n "$sid" ]  && { a="$(tx_pgrep "--session-id $sid ")" || return 2; }
+  [ -n "$uuid" ] && { b="$(tx_pgrep "--resume $uuid")" || return 2; }
+  printf '%s\n%s\n' "$a" "$b" | awk 'NF && !seen[$0]++'
+}
+
+tx_claim_file() { printf '%s/%s.jsonl.claim\n' "$(tx_dir "$1")" "$2"; }
+
+# Record which identity holds a shared transcript. Written as the config dir, not the
+# account name: identities are matched by directory everywhere else in crc, and a
+# registry is free to call the primary identity anything it likes.
+tx_claim_set() {
+  local wt="$1" uuid="$2" account="$3" cfgdir="$4" f
+  f="$(tx_claim_file "$wt" "$uuid")"
+  mkdir -p "$(dirname "$f")"
+  printf '{"account":%s,"config_dir":%s,"set_at":%s}\n' \
+    "$(printf '%s' "$account" | json_str)" \
+    "$(printf '%s' "$cfgdir" | json_str)" \
+    "$(printf '%s' "$(date '+%Y-%m-%d %H:%M:%S %Z')" | json_str)" > "$f"
+}
+
+tx_claim_holder() {
+  local f; f="$(tx_claim_file "$1" "$2")"
+  [ -f "$f" ] || return 1
+  python3 - "$f" <<'PY'
+import json, sys
+try:
+    c = json.load(open(sys.argv[1])) or {}
+except Exception:
+    sys.exit(1)
+print(c.get("account") or c.get("config_dir") or "?")
+PY
+}
+
+# Make one file the transcript of every identity on this machine. Idempotent: run it
+# again after adding an account and that account gets its link.
+tx_centralize() {
+  local wt="$1" uuid="$2" central src cfg p dest found=""
+  central="$(tx_dir "$wt")"
+  src="$central/$uuid.jsonl"
+  mkdir -p "$central" || { warn "could not create $central"; return 1; }
+
+  if [ ! -e "$src" ]; then
+    for cfg in $(tx_config_dirs); do
+      p="$(tx_proj "$cfg" "$wt")/$uuid.jsonl"
+      [ -f "$p" ] && [ ! -L "$p" ] && found="$found $p"
+    done
+    # shellcheck disable=SC2086
+    [ -n "$found" ] && found="$(ls -t $found 2>/dev/null | head -1)" || found=""
+    [ -n "$found" ] || { warn "no transcript file named $uuid.jsonl under any identity"; return 1; }
+    mv "$found" "$src" || { warn "could not move $found -> $src"; return 1; }
+    say "  centralized -> $src ($(wc -c < "$src" | tr -d ' ') bytes)"
+  fi
+
+  for cfg in $(tx_config_dirs); do
+    p="$(tx_proj "$cfg" "$wt")"
+    dest="$p/$uuid.jsonl"
+    mkdir -p "$p" || { warn "could not create $p"; return 1; }
+    if [ -L "$dest" ]; then
+      [ "$(readlink "$dest")" = "$src" ] && continue
+      rm -f "$dest"
+    elif [ -f "$dest" ]; then
+      # A real file at the shared name: an older 'crc fork' copied one here and it has
+      # its own tail. Keep it, named so nobody mistakes it for live, rather than
+      # deleting a conversation to make room for a link.
+      mv "$dest" "$dest.pre-centralize" || { warn "could not move aside $dest"; return 1; }
+      warn "  kept $(basename "$cfg")'s own copy as $(basename "$dest").pre-centralize"
+    fi
+    ln -s "$src" "$dest" || { warn "could not link $dest"; return 1; }
+    say "  linked $(basename "$cfg")"
+  done
+  return 0
+}
+
+# Is this chat's transcript shared? A file in the central store is the mark.
+tx_shared() {
+  [ -f "$(tx_dir "$1")/$2.jsonl" ]
 }
 
 # The branch a chat was last on, read from the newest transcript written for its worktree.
@@ -447,6 +661,31 @@ cmd_revive() {
   say "revived $sid in tmux session $session"
 }
 
+# Is this chat in the middle of a turn? A turn is in progress when the last model
+# request it made (source=sdk; side queries run only after a turn ends) is newer than
+# the last "turn N end" line. Prints busy | idle | unknown — unknown when the process
+# has no debug log to read, which is not the same as idle and must not be treated as it.
+chat_mid_turn() {
+  local pid="$1" log
+  log="$(ps -o command= -p "$pid" 2>/dev/null | sed -n 's/.*--debug-file \([^ ]*\).*/\1/p')"
+  [ -n "$log" ] && [ -f "$log" ] || { echo unknown; return 0; }
+  awk '/\[engine\] turn [0-9]+ end/{e=NR} /API REQUEST\] \/v1\/messages .*source=sdk/{r=NR}
+       END{ if (r > e) print "busy"; else print "idle" }' "$log"
+}
+
+# Stop one chat process and wait for it to actually be gone.
+chat_kill() {
+  local pid="$1" i
+  kill -TERM "$pid" 2>/dev/null || { warn "could not signal pid $pid"; return 1; }
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  warn "pid $pid did not exit on SIGTERM; killed"
+  return 0
+}
+
 # Restart one live chat without touching its server or the other chats. Each chat is its
 # own child process (--session-id cse_…). When it exits the server releases the chat, and
 # the next message sent to it makes the server spawn it again with --resume, in the same
@@ -467,23 +706,14 @@ cmd_restart_session() {
   local pid; pid="$(pgrep -f -- "--session-id $sid " 2>/dev/null | head -1)"
   [ -n "$pid" ] || die "$sid is not running on this machine — it is either stopped already (send it a message) or belongs to another host"
 
-  local args log server="?" n
-  args="$(ps -o command= -p "$pid" 2>/dev/null)"
-  log="$(printf '%s\n' "$args" | sed -n 's/.*--debug-file \([^ ]*\).*/\1/p')"
+  local server="?" n
   for n in $(reg_names); do
     srv_pids "$n" | grep -qx "$(ps -o ppid= -p "$pid" | tr -d ' ')" && { server="$n"; break; }
   done
 
-  # Refuse to cut a chat off mid-turn. A turn is in progress when the last model request
-  # the chat made (source=sdk; side queries run after a turn ends) is newer than the last
-  # "turn N end" line.
+  # Refuse to cut a chat off mid-turn.
   if [ "$force" = 0 ]; then
-    local state=unknown
-    if [ -n "$log" ] && [ -f "$log" ]; then
-      state="$(awk '/\[engine\] turn [0-9]+ end/{e=NR} /API REQUEST\] \/v1\/messages .*source=sdk/{r=NR}
-                   END{ if (r > e) print "busy"; else print "idle" }' "$log")"
-    fi
-    case "$state" in
+    case "$(chat_mid_turn "$pid")" in
       busy)    die "$sid is in the middle of a turn — wait for it to finish, or pass --force" ;;
       unknown) die "cannot tell whether $sid is mid-turn (no debug log) — pass --force to restart anyway" ;;
     esac
@@ -491,16 +721,7 @@ cmd_restart_session() {
 
   if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would stop $sid (pid $pid, server $server)"; return 0; fi
 
-  kill -TERM "$pid" 2>/dev/null || die "could not signal pid $pid"
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null || true
-    warn "$sid did not exit on SIGTERM; killed"
-  fi
+  chat_kill "$pid" || exit 1
   crc_log "restart-session $sid (pid $pid, server $server)"
   say "$sid: stopped (pid $pid, server $server)"
   say "send the chat any message to bring it back — it resumes in the same worktree, usually within seconds, occasionally a couple of minutes"
@@ -906,13 +1127,14 @@ cmd_account() {
 # work should not stop.
 
 fork_hooks_install() {
-  local dir="$1" hook="$CRC_ROOT/hooks/session-log.py" out
-  [ -f "$hook" ] || { warn "hook script missing at $hook — skipping the shared log"; return 1; }
-  command -v python3 >/dev/null 2>&1 || { warn "python3 not found — skipping the shared log"; return 1; }
-  chmod +x "$hook" 2>/dev/null || true
-  out="$(python3 - "$dir/.claude/settings.local.json" "$hook" <<'PY'
+  local dir="$1" log="$CRC_ROOT/hooks/session-log.py" claim="$CRC_ROOT/hooks/transcript-claim.py" out
+  [ -f "$log" ]   || { warn "hook script missing at $log — skipping the shared log"; return 1; }
+  [ -f "$claim" ] || { warn "hook script missing at $claim — skipping the transcript guard"; return 1; }
+  command -v python3 >/dev/null 2>&1 || { warn "python3 not found — skipping the worktree hooks"; return 1; }
+  chmod +x "$log" "$claim" 2>/dev/null || true
+  out="$(python3 - "$dir/.claude/settings.local.json" "$log" "$claim" <<'PY'
 import json, os, sys
-path, hook = sys.argv[1], sys.argv[2]
+path, log, claim = sys.argv[1], sys.argv[2], sys.argv[3]
 os.makedirs(os.path.dirname(path), exist_ok=True)
 try:
     cfg = json.load(open(path)) or {}
@@ -920,8 +1142,7 @@ except Exception:
     cfg = {}
 hooks = cfg.setdefault("hooks", {})
 changed = []
-def install(event, matcher, mode):
-    cmd = "%s %s" % (hook, mode)
+def install(event, matcher, cmd):
     entries = hooks.setdefault(event, [])
     for group in entries:
         for h in group.get("hooks", []):
@@ -931,19 +1152,23 @@ def install(event, matcher, mode):
     if matcher:                       # UserPromptSubmit has no matchers; it always fires
         group["matcher"] = matcher
     entries.append(group)
-    changed.append(event)
-install("Stop", "*", "stop")
-install("SessionStart", "startup|resume|fork", "start")
+    if event not in changed:
+        changed.append(event)
+install("Stop", "*", log + " stop")
+install("SessionStart", "startup|resume|fork", log + " start")
 # Without this one the log is only ever read at a session start, so a chat that is
 # already running learns nothing until it restarts — the case the log is for.
-install("UserPromptSubmit", "", "turn")
+install("UserPromptSubmit", "", log + " turn")
+# The shared-transcript guard. Its own script on purpose: the log hook must never
+# break the session it is attached to, and this one must — exit 2 is the whole point.
+install("UserPromptSubmit", "", claim)
 if changed:
     json.dump(cfg, open(path, "w"), indent=2)
     open(path, "a").write("\n")
 print(",".join(changed) if changed else "already installed")
 PY
-)" || { warn "could not install the shared-log hooks"; return 1; }
-  say "shared log hooks: $out"
+)" || { warn "could not install the worktree hooks"; return 1; }
+  say "worktree hooks: $out"
 }
 
 # Installing the hooks is its own command because the set grows: a worktree set up by
@@ -1080,6 +1305,331 @@ cmd_fork() {
   else warn "no session link appeared yet — watch it with 'tmux attach -t $session'"; return 1; fi
 }
 
+# ---------------------------------------------------------------------------
+# Switching a chat between accounts.
+#
+# 'crc fork' copies a transcript and takes a new session id, so the two accounts
+# diverge from the moment of the fork: good for handing work over once, useless for
+# going back and forth. 'crc switch' shares the file instead — see "Centralized
+# transcripts" above — so the same conversation can move between subscriptions as
+# often as the rate limits demand, and each side arrives holding everything the other
+# one did. The link changes every time; the conversation does not.
+#
+# What switching can never do is run the chat under both accounts at once. Both
+# accounts can be busy at the same time — ten chats under one and ten under the
+# other is fine — but one chat has one writer. That is per chat, not per account.
+
+# Every chat worktree on this machine, as "<session id> <server> <worktree>".
+chat_list() {
+  local n d w sid
+  for n in $(reg_names); do
+    d="$(srv_dir "$n" 2>/dev/null || echo '')"
+    [ -n "$d" ] || continue
+    for w in "$d"/.claude/worktrees/bridge-*; do
+      [ -d "$w" ] || continue
+      sid="$(basename "$w")"; sid="${sid#bridge-}"
+      printf '%s %s %s\n' "$sid" "$n" "$w"
+    done
+  done | awk 'NF && !seen[$1]++'     # two servers can point at one repo
+}
+
+# The worktree a chat id names, under the workspace that owns it.
+chat_worktree() {
+  local sid="$1" owner
+  owner="$(chat_owner "$sid")" || return 1
+  printf '%s/.claude/worktrees/bridge-%s\n' "${owner%% *}" "$sid"
+}
+
+tx_row() {
+  local sid="$1" server="$2" wt="$3" uuid shared=no links=- holder=- live=- cfg n=0 tot=0 w
+  uuid="$(tx_uuid "$wt" 2>/dev/null)" || uuid=""
+  if [ -n "$uuid" ] && tx_shared "$wt" "$uuid"; then
+    shared=yes
+    for cfg in $(tx_config_dirs); do
+      tot=$((tot + 1))
+      [ -L "$(tx_proj "$cfg" "$wt")/$uuid.jsonl" ] && n=$((n + 1))
+    done
+    links="$n/$tot"
+    holder="$(tx_claim_holder "$wt" "$uuid" 2>/dev/null || echo -)"
+  fi
+  if w="$(tx_writers "$sid" "$uuid" 2>/dev/null)"; then
+    [ -n "$w" ] && live="$(echo "$w" | tr '\n' ',' | sed 's/,$//')"
+  else
+    live="?"
+  fi
+  printf '%-30s %-14s %-7s %-6s %-22s %s\n' "$sid" "$server" "$shared" "$links" "$holder" "$live"
+}
+
+cmd_transcripts() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+  list)
+    local chats; chats="$(chat_list)"
+    [ -n "$chats" ] || { say "no chat worktrees on this machine"; return 0; }
+    printf '%-30s %-14s %-7s %-6s %-22s %s\n' SESSION SERVER SHARED LINKS HOLDER 'WRITER PIDS'
+    printf '%s\n' "$chats" | while read -r sid server wt; do
+      tx_row "$sid" "$server" "$wt"
+    done
+    say ""
+    say "SHARED=yes means one file, linked into LINKS identities. HOLDER is the account"
+    say "the transcript guard lets prompt; 'crc switch <session> --to <account>' moves it."
+    return 0 ;;
+
+  centralize)
+    local all=0 sids="" sid wt uuid writers rc=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --all) all=1; shift ;;
+        -*) die "unknown option: $1" ;;
+        *) sids="$sids $1"; shift ;;
+      esac
+    done
+    [ "$all" = 1 ] && sids="$(chat_list | awk '{print $1}')"
+    [ -n "$sids" ] || die "usage: crc transcripts centralize <session-id>... | --all"
+    for sid in $sids; do
+      case "$sid" in bridge-cse_*) sid="cse_${sid#bridge-cse_}" ;; esac
+      wt="$(chat_worktree "$sid")" || { warn "$sid: no registered workspace owns it"; rc=1; continue; }
+      uuid="$(tx_uuid "$wt" 2>/dev/null)" || { warn "$sid: no transcript to centralize"; rc=1; continue; }
+      # Centralizing moves the file. A live session opens it per write, so a move
+      # under its feet loses whatever it appends next — silently, which is the one
+      # outcome this whole mechanism exists to avoid.
+      writers="$(tx_writers "$sid" "$uuid")" || {
+        warn "$sid: skipped — cannot tell whether a session is writing it"
+        rc=1; continue; }
+      if [ -n "$writers" ]; then
+        warn "$sid: skipped — a session is writing it now (pid $(echo "$writers" | tr '\n' ' '))"
+        warn "  stop it with 'crc restart-session $sid', or hand it over with 'crc switch $sid --to <account>'"
+        rc=1; continue
+      fi
+      say "$sid ($uuid)"
+      if [ "${CRC_DRY_RUN:-0}" = 1 ]; then
+        say "  [dry-run] would centralize it and link it into: $(tx_config_dirs | tr '\n' ' ')"
+        continue
+      fi
+      tx_centralize "$wt" "$uuid" || rc=1
+    done
+    return $rc ;;
+
+  release)
+    local sid="${1:-}" wt uuid f
+    [ -n "$sid" ] || die "usage: crc transcripts release <session-id>"
+    case "$sid" in bridge-cse_*) sid="cse_${sid#bridge-cse_}" ;; esac
+    wt="$(chat_worktree "$sid")" || die "no registered workspace owns $sid"
+    uuid="$(tx_uuid "$wt")" || exit 1
+    f="$(tx_claim_file "$wt" "$uuid")"
+    [ -f "$f" ] || { say "$sid: no claim to release"; return 0; }
+    rm -f "$f"
+    say "$sid: claim released"
+    warn "nothing now stops two accounts resuming it at once, which forks the"
+    warn "conversation and drops a branch. 'crc switch $sid --to <account>' puts a claim back."
+    return 0 ;;
+
+  check)
+    # The damage concurrent writers do is invisible in the file's own terms: it stays
+    # valid jsonl, every line parses, nothing is missing. What gives it away is the
+    # shape — a row with two children means two sessions answered the same parent,
+    # and only one of those branches is in the conversation now.
+    local all=0 sids="" sid wt uuid src rc=0 cfg other
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --all) all=1; shift ;;
+        -*) die "unknown option: $1" ;;
+        *) sids="$sids $1"; shift ;;
+      esac
+    done
+    [ -n "$sids" ] || all=1
+    [ "$all" = 1 ] && sids="$(chat_list | awk '{print $1}')"
+    for sid in $sids; do
+      case "$sid" in bridge-cse_*) sid="cse_${sid#bridge-cse_}" ;; esac
+      wt="$(chat_worktree "$sid")" || continue
+      uuid="$(tx_uuid "$wt" 2>/dev/null)" || continue
+      tx_shared "$wt" "$uuid" || continue          # only shared files can be raced
+      src="$(tx_dir "$wt")/$uuid.jsonl"
+      say "$sid ($uuid)"
+      # A real transcript beside the link means a session in this worktree wrote
+      # somewhere else — the share was bypassed, and that work is in no account's
+      # shared history.
+      for cfg in $(tx_config_dirs); do
+        for other in "$(tx_proj "$cfg" "$wt")"/*.jsonl; do
+          [ -f "$other" ] && [ ! -L "$other" ] \
+            && warn "  NOT SHARED: $other (a session in this worktree wrote its own transcript)"
+        done
+      done
+      python3 - "$src" <<'PY' || rc=1
+import collections, json, sys
+kids = collections.defaultdict(list)
+first = {}
+bad = total = 0
+for line in open(sys.argv[1], errors="replace"):
+    line = line.strip()
+    if not line:
+        continue
+    total += 1
+    try:
+        row = json.loads(line)
+    except Exception:
+        bad += 1
+        continue
+    uid = row.get("uuid")
+    if not uid:
+        continue
+    kids[row.get("parentUuid")].append(uid)
+    msg = (row.get("message") or {}).get("content")
+    if isinstance(msg, list):
+        msg = " ".join(b.get("text", "") for b in msg if isinstance(b, dict))
+    first[uid] = "%s: %s" % (row.get("type", "?"), (msg or "").strip().replace("\n", " ")[:70])
+splits = sorted((p, c) for p, c in kids.items() if p and len(c) > 1)
+print("  %d rows, %d unparseable" % (total, bad))
+if not splits:
+    print("  one chain, no split points — never written by two sessions at once")
+    sys.exit(0)
+print("  %d SPLIT POINT(S): two sessions answered the same parent here." % len(splits))
+print("  Everything under all but one branch is in the file but not in the conversation.")
+for parent, children in splits[:5]:
+    print("  parent %s ->" % parent[:8])
+    for c in children:
+        print("      %s  %s" % (c[:8], first.get(c, "?")))
+if len(splits) > 5:
+    print("  … and %d more" % (len(splits) - 5))
+sys.exit(1)
+PY
+    done
+    return $rc ;;
+
+  *) die "usage: crc transcripts <list|centralize <session-id>...|--all|release <session-id>|check [<session-id>...]>" ;;
+  esac
+}
+
+cmd_switch() {
+  local sid="" to="" rcname="" force=0 start=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to)       to="${2:-}"; shift 2 ;;
+      --name)     rcname="${2:-}"; shift 2 ;;
+      --force)    force=1; shift ;;
+      --no-start) start=0; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) sid="$1"; shift ;;
+    esac
+  done
+  [ -n "$sid" ] || die "usage: crc switch <session-id> --to <account> [--name <rc name>] [--force] [--no-start]"
+  [ -n "$to" ]  || die "which account should continue it? pass --to <name> (crc account list)"
+  case "$sid" in bridge-cse_*) sid="cse_${sid#bridge-cse_}" ;; esac
+
+  local target; target="$(acct_dir "$to")" || die "unknown account: $to (crc account add $to)"
+  [ -d "$target" ] || die "$to has no config dir at $target"
+
+  local owner repo server wt
+  owner="$(chat_owner "$sid")" || die "no registered workspace has a worktree for $sid"
+  repo="${owner%% *}"; server="${owner##* }"
+  wt="$repo/.claude/worktrees/bridge-$sid"
+  [ -d "$wt" ] || die "the worktree for $sid is gone ($wt) — 'crc revive $sid' puts it back first"
+
+  local uuid; uuid="$(tx_uuid "$wt")" || exit 1
+  local src_acct src_cfg back=0
+  src_acct="$(srv_account "$server")"
+  src_cfg="$(acct_dir "$src_acct")"
+  # "Back" is keyed on the directory, not the name: the chat belongs to whichever
+  # identity its server runs as, and a registry may call that identity anything.
+  [ "$target" = "$src_cfg" ] && back=1
+
+  # 1. Stop whoever holds it. A shared transcript with two writers loses a branch.
+  local f writers pid
+  for f in $(fork_names); do
+    [ "$(fork_get "$f" uuid)" = "$uuid" ] || continue
+    fork_running "$f" || continue
+    say "stopping fork '$f' — it holds this transcript"
+    fork_stop "$f"
+  done
+  writers="$(tx_writers "$sid" "$uuid")" \
+    || die "cannot tell what is writing $uuid — refusing to risk a second writer on it"
+  for pid in $writers; do
+    kill -0 "$pid" 2>/dev/null || continue
+    if [ "$force" = 0 ]; then
+      case "$(chat_mid_turn "$pid")" in
+        busy)    die "$sid is in the middle of a turn (pid $pid) — let it finish, or pass --force" ;;
+        unknown) die "cannot tell whether pid $pid is mid-turn (it has no debug log) — pass --force to switch anyway" ;;
+      esac
+    fi
+    say "stopping pid $pid — it holds this transcript"
+    chat_kill "$pid"
+  done
+  writers="$(tx_writers "$sid" "$uuid")" \
+    || die "cannot tell what is writing $uuid — refusing to risk a second writer on it"
+  [ -z "$writers" ] || die "something is still writing $uuid (pid $(echo "$writers" | tr '\n' ' ')) — refusing to resume it twice"
+
+  if [ "${CRC_DRY_RUN:-0}" = 1 ]; then
+    say "[dry-run] would centralize $uuid for $wt and claim it for $to"
+    [ "$back" = 1 ] && say "[dry-run] then disable the forks pinned to it — $to owns it through $server" \
+                    || say "[dry-run] then resume it as $to in $wt as '${rcname:-$server-$to}'"
+    return 0
+  fi
+
+  # 2. One file, linked into every identity. Idempotent, so switching back and forth
+  #    costs nothing after the first time.
+  say "$sid ($uuid)"
+  tx_centralize "$wt" "$uuid" || die "could not centralize the transcript"
+
+  # 3. The target identity has to trust the worktree, or the resume dies on a dialog
+  #    nobody is watching. This used to be answered by hand with tmux send-keys.
+  if ! trust_ok "$wt" "$target"; then
+    say "$to has no trust on record for this worktree"
+    trust_accept "$wt" "$target" \
+      || die "$to still does not trust $wt — accept it by hand:  cd $wt && CLAUDE_CONFIG_DIR=$target claude"
+  fi
+  fork_hooks_install "$wt" || true
+  tx_claim_set "$wt" "$uuid" "$to" "$target"
+
+  if [ "$back" = 1 ]; then
+    # Nothing for crc to start: the chat is its own server's again, and the server
+    # spawns it the moment it gets a message.
+    for f in $(fork_names); do
+      [ "$(fork_get "$f" uuid)" = "$uuid" ] || continue
+      reg_set "fork:$f" enabled false
+      say "fork '$f': disabled — $to holds the chat again"
+    done
+    crc_log "switch $sid -> $to (its own server, $server)"
+    say ""
+    say "$sid belongs to $to again, carrying everything the other account did."
+    local e; e="$(srv_env_id "$server" 2>/dev/null || echo '')"
+    if [ -n "$e" ]; then
+      say "Message it in the app and $server resumes it:  https://claude.ai/code?environment=$e"
+    else
+      say "Message it in the app and $server resumes it."
+    fi
+    return 0
+  fi
+
+  [ -n "$rcname" ] || rcname="$server-$to"
+  # One pinned entry per transcript, or the next tick starts two writers on it.
+  for f in $(fork_names); do
+    [ "$f" = "$rcname" ] && continue
+    [ "$(fork_get "$f" uuid)" = "$uuid" ] || continue
+    reg_set "fork:$f" enabled false
+    say "fork '$f': disabled — it was pinned to the same transcript"
+  done
+  reg_set "fork:$rcname" dir "$wt"
+  reg_set "fork:$rcname" account "$to"
+  reg_set "fork:$rcname" origin "$sid"
+  reg_set "fork:$rcname" uuid "$uuid"
+  reg_set "fork:$rcname" enabled true
+  crc_log "switch $sid -> $to as '$rcname' on transcript $uuid"
+
+  if [ "$start" = 0 ]; then
+    say ""
+    say "'$rcname' is recorded and holds the transcript, but was not started."
+    say "Start it when you want it:  crc forks start $rcname"
+    return 0
+  fi
+
+  say ""
+  say "resuming it as $to — replaying the transcript takes a minute"
+  fork_start "$rcname" || return 1
+  say ""
+  say "Same conversation, new link. The chat under $src_acct is now refused at its"
+  say "first message until you hand it back:  crc switch $sid --to $src_acct"
+}
+
 # Append to the shared log by hand, for a chat that started before the hooks existed.
 cmd_handoff() {
   local sid="" from="" text=""
@@ -1146,6 +1696,10 @@ EOF
 # What is recorded is the *worktree and identity*, not a transcript id: every
 # restart writes a new transcript (--fork-session), so the newest one in that
 # worktree under that identity is what should be resumed next time.
+#
+# A fork recorded by 'crc switch' is the exception, and carries a 'uuid' key. That
+# one shares a single transcript file with the account that owns the chat, so it is
+# resumed by name and without --fork-session — see "Centralized transcripts" above.
 
 fork_names() {
   local f; f="$(reg_file)"
@@ -1163,6 +1717,30 @@ fork_dir()      { local d; d="$(fork_get "$1" dir)"; case "$d" in "~"/*) d="$HOM
 # makes every fork look stopped, and the supervisor starts a second copy of each.
 fork_running()  { pgrep -f -- "--remote-control $1(\$| )" >/dev/null 2>&1; }
 
+# Stop a fork and wait for it to be gone. Same end-of-string anchor as fork_running:
+# the name is the last argument, so a trailing space never matches and the fork is
+# silently left running — which, for a fork sharing a transcript, would let the next
+# start write it twice.
+fork_stop() {
+  local n="$1" pids i
+  pids="$(pgrep -f -- "--remote-control $n(\$| )" 2>/dev/null)"
+  if [ -n "$pids" ]; then
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      pgrep -f -- "--remote-control $n(\$| )" >/dev/null 2>&1 || break
+      sleep 1
+    done
+    pgrep -f -- "--remote-control $n(\$| )" >/dev/null 2>&1 && {
+      # shellcheck disable=SC2086
+      kill -KILL $pids 2>/dev/null; warn "$n did not exit on SIGTERM; killed"; }
+    say "$n: stopped"
+  else
+    say "$n: not running"
+  fi
+  "$(crc_tmux)" kill-session -t "=fork-$n" 2>/dev/null || true
+}
+
 # The newest transcript this identity has for that worktree.
 fork_transcript() {
   local dir="$1" cfg="$2" mangled
@@ -1173,7 +1751,7 @@ fork_transcript() {
 }
 
 fork_start() {
-  local name="$1" dir cfg uuid tmux claude session i url
+  local name="$1" dir cfg uuid pinned flags writers tmux claude session i url
   fork_has "$name" || { warn "unknown fork: $name"; return 1; }
   [ "$(fork_get "$name" enabled)" = false ] && { say "$name: disabled, skipping"; return 0; }
   fork_running "$name" && return 0
@@ -1185,15 +1763,39 @@ fork_start() {
   dir="$(fork_dir "$name")"
   [ -d "$dir" ] || { warn "$name: worktree is gone ($dir) — 'crc forks forget $name' if it is not coming back"; return 1; }
   cfg="$(acct_dir "$(fork_get "$name" account)")" || { warn "$name: unknown account"; return 1; }
-  uuid="$(fork_transcript "$dir" "$cfg")" || { warn "$name: no transcript for this worktree under that account"; return 1; }
+
+  # A pinned uuid means this entry shares one transcript file with the account that
+  # owns the chat ('crc switch'). Then --fork-session is exactly wrong: it would mint
+  # a new id and the two accounts would stop seeing each other's work. Resuming it
+  # while the other side is live is worse than wrong — concurrent writers fork the
+  # conversation and the next resume drops a branch without saying so — so that is a
+  # refusal, including when the refuser is the supervisor's own tick.
+  pinned="$(fork_get "$name" uuid)"
+  if [ -n "$pinned" ]; then
+    uuid="$pinned"
+    flags="--resume $uuid"
+    writers="$(tx_writers "$(fork_get "$name" origin)" "$uuid")" || {
+      warn "$name: cannot tell what is writing $uuid — not resuming it on a guess"
+      return 1; }
+    [ -z "$writers" ] || {
+      warn "$name: $uuid is already being written (pid $(echo "$writers" | tr '\n' ' ')) — not resuming it twice"
+      return 1; }
+    [ -e "$(tx_proj "$cfg" "$dir")/$uuid.jsonl" ] || {
+      warn "$name: $(basename "$cfg") has no transcript at $uuid.jsonl"
+      warn "  relink it with: crc transcripts centralize $(fork_get "$name" origin)"
+      return 1; }
+  else
+    uuid="$(fork_transcript "$dir" "$cfg")" || { warn "$name: no transcript for this worktree under that account"; return 1; }
+    flags="--resume $uuid --fork-session"
+  fi
 
   tmux="$(crc_tmux)"; claude="$(crc_claude)"; session="fork-$name"
-  if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would resume $uuid as $name in $dir"; return 0; fi
+  if [ "${CRC_DRY_RUN:-0}" = 1 ]; then say "[dry-run] would resume $uuid as $name in $dir ($flags)"; return 0; fi
   "$tmux" kill-session -t "=$session" 2>/dev/null || true
   "$tmux" new-session -d -s "$session" -x 220 -y 50 -c "$dir"
   sleep 1
   "$tmux" send-keys -t "${session}:0.0" \
-    "cd $(printf '%q' "$dir") && CLAUDE_CONFIG_DIR=$(printf '%q' "$cfg") $(printf '%q' "$claude") --resume $uuid --fork-session --remote-control $(printf '%q' "$name")" C-m
+    "cd $(printf '%q' "$dir") && CLAUDE_CONFIG_DIR=$(printf '%q' "$cfg") $(printf '%q' "$claude") $flags --remote-control $(printf '%q' "$name")" C-m
 
   for i in $(seq 1 70); do
     url="$("$tmux" capture-pane -pJ -t "${session}:0.0" 2>/dev/null | grep -oE 'https://claude\.ai/code/session_[A-Za-z0-9]+' | tail -1)"
@@ -1216,12 +1818,14 @@ cmd_forks() {
   list)
     local names; names="$(fork_names)"
     [ -z "$names" ] && { say "no supervised forks — 'crc fork <session-id> --account <name>' records one"; return 0; }
-    printf '%-22s %-9s %-10s %s\n' NAME STATE ACCOUNT WORKTREE
+    printf '%-22s %-9s %-10s %-11s %s\n' NAME STATE ACCOUNT TRANSCRIPT WORKTREE
     local n
     for n in $names; do
-      printf '%-22s %-9s %-10s %s\n' "$n" \
-        "$(fork_running "$n" && echo running || echo stopped)" \
-        "$(fork_get "$n" account)" "$(fork_dir "$n")"
+      printf '%-22s %-9s %-10s %-11s %s\n' "$n" \
+        "$(fork_running "$n" && echo running || echo "$( [ "$(fork_get "$n" enabled)" = false ] && echo disabled || echo stopped)")" \
+        "$(fork_get "$n" account)" \
+        "$( [ -n "$(fork_get "$n" uuid)" ] && echo shared || echo own)" \
+        "$(fork_dir "$n")"
     done ;;
   start)
     local n="${1:-}"
@@ -1229,25 +1833,7 @@ cmd_forks() {
     else for n in $(fork_names); do fork_start "$n"; done; fi ;;
   stop)
     local n="${1:-}"; [ -n "$n" ] || die "usage: crc forks stop <name>"
-    # Same end-of-string anchor as fork_running: the name is the last argument, so a
-    # trailing space never matches and the fork is silently left running.
-    local pids; pids="$(pgrep -f -- "--remote-control $n(\$| )" 2>/dev/null)"
-    if [ -n "$pids" ]; then
-      # shellcheck disable=SC2086
-      kill $pids 2>/dev/null
-      local i
-      for i in 1 2 3 4 5 6 7 8 9 10; do
-        pgrep -f -- "--remote-control $n(\$| )" >/dev/null 2>&1 || break
-        sleep 1
-      done
-      pgrep -f -- "--remote-control $n(\$| )" >/dev/null 2>&1 && {
-        # shellcheck disable=SC2086
-        kill -KILL $pids 2>/dev/null; warn "$n did not exit on SIGTERM; killed"; }
-      say "$n: stopped"
-    else
-      say "$n: not running"
-    fi
-    "$(crc_tmux)" kill-session -t "=fork-$n" 2>/dev/null || true ;;
+    fork_stop "$n" ;;
   adopt)
     # Take over a fork that was started by hand: record it without touching the
     # running process, so the supervisor restarts it next time it is missing.
@@ -1450,6 +2036,34 @@ cmd_doctor() {
     done
   done
 
+  # Two forks pinned to one transcript would both be started by the supervisor, and
+  # the loser's branch disappears from the conversation without an error anywhere.
+  local f g u
+  for f in $(fork_names); do
+    u="$(fork_get "$f" uuid)"
+    [ -n "$u" ] || continue
+    [ "$(fork_get "$f" enabled)" = false ] && continue
+    for g in $(fork_names); do
+      [ "$f" = "$g" ] && continue
+      [ "$(fork_get "$g" uuid)" = "$u" ] || continue
+      [ "$(fork_get "$g" enabled)" = false ] && continue
+      warn "conflict:  forks $f and $g are both pinned to transcript $u"
+      warn "           disable one — two writers fork the conversation and drop a branch"
+      ok=1
+      break 2
+    done
+  done
+
+  # A link whose target is gone leaves an identity resuming nothing, or worse,
+  # starting a fresh transcript at the shared name.
+  local cfg broken=0 l
+  for cfg in $(tx_config_dirs); do
+    for l in "$cfg"/projects/*/*.jsonl; do
+      [ -L "$l" ] && [ ! -e "$l" ] && { warn "broken:    $l -> $(readlink "$l")"; broken=1; }
+    done
+  done
+  [ "$broken" = 1 ] && { warn "           'crc transcripts centralize --all' relinks what is still there"; ok=1; }
+
   say ""
   local n why
   for n in $(reg_names); do
@@ -1574,6 +2188,8 @@ main() {
     login)        cmd_login "$@" ;;
     account)      cmd_account "$@" ;;
     fork)         cmd_fork "$@" ;;
+    switch)       cmd_switch "$@" ;;
+    transcripts)  cmd_transcripts "$@" ;;
     hooks)        cmd_hooks "$@" ;;
     forks)        cmd_forks "$@" ;;
     handoff)      cmd_handoff "$@" ;;
