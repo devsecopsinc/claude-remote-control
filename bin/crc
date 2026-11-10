@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.10.0"
+VERSION="1.10.1"
 
 crc_migrate_legacy
 
@@ -676,6 +676,11 @@ chat_mid_turn() {
 # Stop one chat process and wait for it to actually be gone.
 chat_kill() {
   local pid="$1" i
+  # The guard lives here, not only at the call sites, because a caller that forgets it
+  # kills a live chat while reporting a rehearsal. 'crc switch' did exactly that: it
+  # printed "[dry-run] would centralize …" having already SIGTERMed the chat, because
+  # its dry-run branch sat below the loop that stops the current writer.
+  [ "${CRC_DRY_RUN:-0}" = 1 ] && { say "[dry-run] would stop pid $pid"; return 0; }
   kill -TERM "$pid" 2>/dev/null || { warn "could not signal pid $pid"; return 1; }
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     kill -0 "$pid" 2>/dev/null || return 0
@@ -1538,7 +1543,7 @@ cmd_switch() {
   for f in $(fork_names); do
     [ "$(fork_get "$f" uuid)" = "$uuid" ] || continue
     fork_running "$f" || continue
-    say "stopping fork '$f' — it holds this transcript"
+    [ "${CRC_DRY_RUN:-0}" = 1 ] || say "stopping fork '$f' — it holds this transcript"
     fork_stop "$f"
   done
   writers="$(tx_writers "$sid" "$uuid")" \
@@ -1551,12 +1556,16 @@ cmd_switch() {
         unknown) die "cannot tell whether pid $pid is mid-turn (it has no debug log) — pass --force to switch anyway" ;;
       esac
     fi
-    say "stopping pid $pid — it holds this transcript"
+    [ "${CRC_DRY_RUN:-0}" = 1 ] || say "stopping pid $pid — it holds this transcript"
     chat_kill "$pid"
   done
-  writers="$(tx_writers "$sid" "$uuid")" \
-    || die "cannot tell what is writing $uuid — refusing to risk a second writer on it"
-  [ -z "$writers" ] || die "something is still writing $uuid (pid $(echo "$writers" | tr '\n' ' ')) — refusing to resume it twice"
+  # Only meaningful when something was actually stopped: in a dry run the writers are
+  # all still there by design, and re-checking would refuse every rehearsal.
+  if [ "${CRC_DRY_RUN:-0}" != 1 ]; then
+    writers="$(tx_writers "$sid" "$uuid")" \
+      || die "cannot tell what is writing $uuid — refusing to risk a second writer on it"
+    [ -z "$writers" ] || die "something is still writing $uuid (pid $(echo "$writers" | tr '\n' ' ')) — refusing to resume it twice"
+  fi
 
   if [ "${CRC_DRY_RUN:-0}" = 1 ]; then
     say "[dry-run] would centralize $uuid for $wt and claim it for $to"
@@ -1724,6 +1733,7 @@ fork_running()  { pgrep -f -- "--remote-control $1(\$| )" >/dev/null 2>&1; }
 fork_stop() {
   local n="$1" pids i
   pids="$(pgrep -f -- "--remote-control $n(\$| )" 2>/dev/null)"
+  [ "${CRC_DRY_RUN:-0}" = 1 ] && { say "[dry-run] would stop fork $n (pids: ${pids:-none})"; return 0; }
   if [ -n "$pids" ]; then
     # shellcheck disable=SC2086
     kill $pids 2>/dev/null

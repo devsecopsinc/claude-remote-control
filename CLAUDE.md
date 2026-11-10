@@ -50,6 +50,12 @@ step. Assume every change ships to a running system.
 5. **Never destroy user data on a guess.** `remove` deletes a directory only on an explicit
    `--purge` or an interactive yes; when stdin is not a tty it keeps the directory.
 6. **Respect `CRC_DRY_RUN=1`** in every code path that starts, stops, or deletes anything.
+   `chat_kill` and `fork_stop` carry the guard themselves, because a call site that
+   forgets it stops a live chat while printing a rehearsal — which `crc switch` did for
+   a whole release, its dry-run branch sitting *below* the loop that stops the writer.
+   Put the check in the primitive, and place a command's dry-run branch above anything
+   that acts. When a dry run skips the acting, it must also skip the verification that
+   assumed it: switch re-checks for writers only when it actually stopped some.
 7. **Do not start throwaway servers to test.** Each server start registers an environment,
    and shutdown deliberately skips deregistration, so every experiment leaves a permanent
    ghost entry in the user's app. Test argument parsing in an untrusted temp dir: parsing
