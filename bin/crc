@@ -20,7 +20,7 @@ CRC_ROOT="$(cd -P "$(dirname "$crc_self")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$CRC_ROOT/lib/server.sh"
 
-VERSION="1.10.1"
+VERSION="1.10.2"
 
 crc_migrate_legacy
 
@@ -665,11 +665,20 @@ cmd_revive() {
 # request it made (source=sdk; side queries run only after a turn ends) is newer than
 # the last "turn N end" line. Prints busy | idle | unknown — unknown when the process
 # has no debug log to read, which is not the same as idle and must not be treated as it.
+#
+# Only stop=end_turn ends a turn. The engine logs "turn N end" on stop=tool_use as
+# well, closing an accounting turn when the model asks for a tool — the conversation
+# then runs the tool and carries on. Matching every "turn N end" made the window
+# between that line and the next request (tool execution, then the count_tokens
+# flurry) read as idle, and 'crc switch' stopped a chat eight seconds into a Bash
+# call it had just dispatched. Across every session log on the box: 1585 end_turn,
+# and 25 tool_use/stop_sequence/null — every one of which continued afterwards,
+# 183 to 652 further requests before the real end. Treat only end_turn as the end.
 chat_mid_turn() {
   local pid="$1" log
   log="$(ps -o command= -p "$pid" 2>/dev/null | sed -n 's/.*--debug-file \([^ ]*\).*/\1/p')"
   [ -n "$log" ] && [ -f "$log" ] || { echo unknown; return 0; }
-  awk '/\[engine\] turn [0-9]+ end/{e=NR} /API REQUEST\] \/v1\/messages .*source=sdk/{r=NR}
+  awk '/\[engine\] turn [0-9]+ end.*stop=end_turn/{e=NR} /API REQUEST\] \/v1\/messages .*source=sdk/{r=NR}
        END{ if (r > e) print "busy"; else print "idle" }' "$log"
 }
 

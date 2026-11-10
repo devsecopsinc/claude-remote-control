@@ -140,6 +140,27 @@ whose servers the supervisor does not know about. Also note macOS has `/usr/bin/
 `/bin/false` — a non-existent override binary used to fall back silently and invalidate the
 test; `crc_find` now refuses an override that is not executable.
 
+## Telling a working chat from an idle one
+
+`chat_mid_turn` reads the chat's own debug log and is what `switch` and `restart-session`
+rely on before they stop anything. Two things about it, both paid for:
+
+- **Only `stop=end_turn` ends a turn.** The engine also logs `[engine] turn N end` with
+  `stop=tool_use` — an accounting turn closing when the model asks for a tool, after which
+  the conversation runs the tool and continues. Matching every `turn N end` made the window
+  between that line and the next request read as idle, and `switch` stopped a chat eight
+  seconds into a `Bash` call it had just dispatched. Across every session log on the
+  machine: 1585 `end_turn` against 25 `tool_use`/`stop_sequence`/`null`, and every one of
+  those 25 carried on afterwards — 183 to 652 further requests before the real end.
+- **`unknown` is not `idle`.** A process with no readable debug log returns `unknown`, and
+  callers must refuse rather than assume quiet.
+
+Test it against a captured `rc-<server>-<sid>.log`, not a hand-written one: replay the real
+file truncated to the moment in question and check the verdict flips. `ps` is what supplies
+the log path, so fixtures need a process whose argv carries `--debug-file` — and
+`bash -c 'sleep 20'` exec-optimises into bare `sleep`, discarding that argv, so write
+`bash -c 'sleep 20; true'` or the fixture silently tests nothing.
+
 ## Testing
 
 Never test against the user's live registry:
