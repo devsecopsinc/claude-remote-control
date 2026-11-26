@@ -45,12 +45,21 @@ trust_conf() {
 # A trust check that asks about the worktree is therefore false forever, which made
 # 'crc switch' refuse a handover the CLI would have allowed. Ask about the repo.
 trust_root() {
-  local dir="$1" git common root
+  local dir="$1" git common root wt
   git="$(crc_git 2>/dev/null)" || { printf '%s\n' "$dir"; return 0; }
   common="$(cd "$dir" 2>/dev/null && "$git" rev-parse --git-common-dir 2>/dev/null)" || common=""
   [ -n "$common" ] || { printf '%s\n' "$dir"; return 0; }
   case "$common" in /*) ;; *) common="$dir/$common" ;; esac
-  root="$(cd "$common/.." 2>/dev/null && pwd)" || root=""
+  # A submodule's git dir lives in the superproject (<super>/.git/modules/<name>), so
+  # its parent is not the checkout; git records the checkout as core.worktree, relative
+  # to the git dir. 'git worktree list' reports the git dir here as well, so read it.
+  wt="$("$git" --git-dir="$common" config --get core.worktree 2>/dev/null)" || wt=""
+  if [ -n "$wt" ]; then
+    case "$wt" in /*) ;; *) wt="$common/$wt" ;; esac
+    root="$(cd "$wt" 2>/dev/null && pwd)" || root=""
+  else
+    root="$(cd "$common/.." 2>/dev/null && pwd)" || root=""
+  fi
   printf '%s\n' "${root:-$dir}"
 }
 

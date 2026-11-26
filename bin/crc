@@ -186,7 +186,9 @@ cmd_add() {
     repo="$("$gh" repo view "$create" --json sshUrl -q .sshUrl)"
   fi
 
-  if [ -d "$dir/.git" ]; then
+  # .git is a file, not a directory, in a submodule or a 'git worktree add' checkout
+  # ("gitdir: ..."), so ask git rather than testing for a directory.
+  if [ -e "$dir/.git" ] && "$git" -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     say "using existing repository at $dir"
     [ -z "$repo" ] && repo="$("$git" -C "$dir" remote get-url origin 2>/dev/null || echo '')"
   elif [ -n "$repo" ]; then
@@ -196,6 +198,9 @@ cmd_add() {
   else
     die "no repository: pass --repo <url>, --create <owner/name>, or --dir <existing git repo>"
   fi
+  # Store an absolute path: 'tick' runs from the supervisor's directory, where a relative
+  # --dir (say ".") names some other folder, and the environment id is looked up by path.
+  dir="$(cd "$dir" && pwd)" || die "cannot resolve $dir"
 
   # An empty repo has no commit, and worktree spawn needs one.
   if ! "$git" -C "$dir" rev-parse HEAD >/dev/null 2>&1; then
