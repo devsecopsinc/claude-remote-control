@@ -53,7 +53,13 @@ trust_root() {
   # A submodule's git dir lives in the superproject (<super>/.git/modules/<name>), so
   # its parent is not the checkout; git records the checkout as core.worktree, relative
   # to the git dir. 'git worktree list' reports the git dir here as well, so read it.
-  wt="$("$git" --git-dir="$common" config --get core.worktree 2>/dev/null)" || wt=""
+  #
+  # --local, because a plain 'config --get' also reads global and system config, where
+  # core.worktree applies to every repository at once. Set there, it made this function
+  # return a path belonging to no repo — and when that path exists, every workspace then
+  # reads as untrusted. Git writes a submodule's core.worktree into the repo's own
+  # config, which is the only place worth believing.
+  wt="$("$git" --git-dir="$common" config --local --get core.worktree 2>/dev/null)" || wt=""
   if [ -n "$wt" ]; then
     case "$wt" in /*) ;; *) wt="$common/$wt" ;; esac
     root="$(cd "$wt" 2>/dev/null && pwd)" || root=""
